@@ -4,13 +4,17 @@ receives, SMTP sends. Configured via EMAIL_* env vars or ``platforms.email`` in 
 import asyncio
 import email as email_lib
 from contextlib import contextmanager, suppress
+import hashlib
 import imaplib
+import json
 import logging
 import os
 import re
 import smtplib
 import socket
 import ssl
+import threading
+import time
 import uuid
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
@@ -28,6 +32,7 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform, PlatformConfig
+from plugins.plugin_storage import plugin_data_dir
 from utils import is_truthy_value
 from gateway.platforms._shared import get_scoped_secret as _get_secret, coerce_port, decode_json_list_literal, send_error
 
@@ -105,6 +110,190 @@ def _attach_body(msg: MIMEMultipart, body: str, html: bool) -> None:
     alt.attach(MIMEText(body, "plain", "utf-8"))
     alt.attach(MIMEText(rendered, "html", "utf-8"))
     msg.attach(alt)
+
+
+_MSGID_RE = re.compile(r"<[^<>\s]+>")
+_ROOT_KEY_MAX = 120
+_THREAD_TTL_SECONDS = 90 * 86400  # thread roots (and the ids indexed to them) older than this are pruned on load
+_INDEX_MAX = 5000  # message-id -> root entries kept; the oldest go first
+_REFERENCES_MAX = 20  # ids in an outgoing References header: the root plus the newest 19
+
+
+def _message_ids(header: Optional[str]) -> List[str]:
+    """``<id>`` tokens of a Message-ID / In-Reply-To / References header, in order (folding and junk ignored)."""
+    return _MSGID_RE.findall(header or "")
+
+
+def _root_key(raw: str) -> str:
+    """Session-key-safe thread root from a Message-ID: no ``<>``; anything with whitespace, ``..``, ``/``, ``\\``, a
+    drive-like ``X:`` start, or over 120 chars is replaced by ``h-`` + 24 hex of its SHA-256."""
+    key = (raw or "").strip().strip("<>").strip()
+    unsafe = (not key or len(key) > _ROOT_KEY_MAX or ".." in key or "/" in key or "\\" in key
+              or re.search(r"\s", key) or (len(key) >= 2 and key[0].isalpha() and key[1] == ":"))
+    return "h-" + hashlib.sha256((raw or "").strip().encode("utf-8", "replace")).hexdigest()[:24] if unsafe else key
+
+
+def _bare_id(message_id: Optional[str]) -> str:
+    """A Message-ID without surrounding whitespace and ``<>`` (the store's index key)."""
+    return (message_id or "").strip().strip("<>").strip()
+
+
+class _EmailThreadStore:
+    """Persisted thread roots for the email adapter (``plugin_data_dir("email")/threads.json``).
+
+    Schema ``{"version": 1, "roots": {key: {header, name, subject, job_id, chat_id, pending, created}},
+    "index": {bare message-id: key}, "mailboxes": {address: {uidvalidity, uid_mark}}}``. A missing file is
+    empty; a corrupt one is reset to empty with a warning. Roots older than 90 days are pruned on load. Every
+    mutation writes through atomically (tmp file + ``os.replace``) under one lock, as the IMAP poll and the SMTP
+    sends run in different executor threads. A failed write is a warning; the in-memory state stays."""
+
+    _ROOT_FIELDS = {"header": str, "name": str, "subject": str, "job_id": str, "chat_id": str}
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._lock = threading.Lock()
+        self._roots: Dict[str, Dict[str, Any]] = {}
+        self._index: Dict[str, str] = {}
+        self._mailboxes: Dict[str, Dict[str, Any]] = {}
+        self.load()
+
+    def load(self) -> None:
+        """(Re)read the file: missing → empty; corrupt/unreadable → empty + warning; off-schema entries dropped."""
+        with self._lock:
+            self._roots, self._index, self._mailboxes = {}, {}, {}
+            if not self._path.exists():
+                return
+            try:
+                raw = self._path.read_text(encoding="utf-8-sig")
+                data = json.loads(raw) if raw.strip() else {}
+                if not isinstance(data, dict):
+                    raise ValueError(f"expected an object, got {type(data).__name__}")
+            except (ValueError, OSError) as exc:  # json.JSONDecodeError is a ValueError
+                logger.warning("[Email] thread store at %s is corrupt or unreadable; starting fresh: %s", self._path, exc)
+                return
+            cutoff = time.time() - _THREAD_TTL_SECONDS
+            roots = data.get("roots")
+            for key, root in (roots.items() if isinstance(roots, dict) else ()):
+                if not isinstance(key, str) or not key or not isinstance(root, dict):
+                    continue
+                created = root.get("created")
+                if not isinstance(created, (int, float)) or isinstance(created, bool) or created < cutoff:
+                    continue
+                clean = {f: root.get(f) if isinstance(root.get(f), t) else "" for f, t in self._ROOT_FIELDS.items()}
+                clean.update(pending=root.get("pending") is True, created=float(created))
+                self._roots[key] = clean
+            index = data.get("index")
+            for mid, key in (index.items() if isinstance(index, dict) else ()):
+                if isinstance(mid, str) and mid and isinstance(key, str) and key in self._roots:
+                    self._index[mid] = key
+            self._cap_index()
+            boxes = data.get("mailboxes")
+            for address, state in (boxes.items() if isinstance(boxes, dict) else ()):
+                if isinstance(address, str) and address and isinstance(state, dict):
+                    validity, mark = state.get("uidvalidity"), state.get("uid_mark")
+                    self._mailboxes[address.lower()] = {
+                        "uidvalidity": validity if isinstance(validity, str) else None,
+                        "uid_mark": mark if isinstance(mark, int) and not isinstance(mark, bool) else None}
+
+    def _cap_index(self) -> None:
+        """Drop the oldest (insertion-order) index entries over ``_INDEX_MAX``. Caller holds the lock."""
+        excess = len(self._index) - _INDEX_MAX
+        if excess > 0:
+            for mid in list(self._index)[:excess]:
+                del self._index[mid]
+
+    def _save(self) -> None:
+        """Atomic write-through; failure is a warning (in-memory state is kept). Caller holds the lock."""
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"version": 1, "roots": self._roots, "index": self._index,
+                                       "mailboxes": self._mailboxes}, separators=(",", ":")), encoding="utf-8")
+            os.replace(tmp, self._path)
+        except OSError as exc:
+            logger.warning("[Email] could not persist thread store to %s: %s", self._path, exc)
+
+    def _set_index(self, message_id: Optional[str], key: str) -> None:
+        """Index *message_id* to *key*, newest last. Caller holds the lock."""
+        if mid := _bare_id(message_id):
+            self._index.pop(mid, None)
+            self._index[mid] = key
+            self._cap_index()
+
+    def add_pending_root(self, key: str, header: str, name: str, chat_id: str) -> None:
+        """Record a minted root that has not been sent yet (its first send goes out as a fresh mail)."""
+        with self._lock:
+            self._roots[key] = {"header": header, "name": name or "", "subject": "", "job_id": "",
+                                "chat_id": chat_id or "", "pending": True, "created": time.time()}
+            self._set_index(header, key)
+            self._save()
+
+    def get_root(self, key: Optional[str]) -> Optional[Dict[str, Any]]:
+        """A copy of the root entry, or ``None``."""
+        with self._lock:
+            root = self._roots.get(key or "")
+            return dict(root) if root else None
+
+    def is_pending(self, key: Optional[str]) -> bool:
+        with self._lock:
+            return bool(self._roots.get(key or "", {}).get("pending"))
+
+    def mark_sent(self, key: str, subject: str, job_id: str) -> None:
+        """The root's first mail went out: no longer pending; keep its subject and (non-empty) job id."""
+        with self._lock:
+            if (root := self._roots.get(key)) is None:
+                return
+            root.update(pending=False, subject=subject or root.get("subject", ""))
+            if job_id:
+                root["job_id"] = job_id
+            self._save()
+
+    def remember_root(self, key: str, header: str, subject: str) -> None:
+        """Record a root Hermes did not mint (sent, not pending); a known key is left as it is."""
+        with self._lock:
+            if key in self._roots:
+                return
+            self._roots[key] = {"header": header or "", "name": "", "subject": subject or "", "job_id": "",
+                                "chat_id": "", "pending": False, "created": time.time()}
+            self._set_index(header, key)
+            self._save()
+
+    def index_message(self, message_id: Optional[str], key: str) -> None:
+        """Map a message in the thread to its root (empty ids are ignored)."""
+        if not _bare_id(message_id):
+            return
+        with self._lock:
+            self._set_index(message_id, key)
+            self._save()
+
+    def root_for(self, ids: List[str]) -> Optional[str]:
+        """The root of the first id in *ids* (in order) that the index maps to a known root."""
+        with self._lock:
+            for mid in ids or ():
+                if (key := self._index.get(_bare_id(mid))) and key in self._roots:
+                    return key
+            return None
+
+    def uid_state(self, address: str) -> Tuple[Optional[str], Optional[int]]:
+        """``(uidvalidity, uid_mark)`` stored for a mailbox address, ``(None, None)`` when unknown."""
+        with self._lock:
+            state = self._mailboxes.get((address or "").lower(), {})
+            return state.get("uidvalidity"), state.get("uid_mark")
+
+    def set_uid_state(self, address: str, uidvalidity: Optional[str], uid_mark: Optional[int]) -> None:
+        with self._lock:
+            self._mailboxes[(address or "").lower()] = {"uidvalidity": uidvalidity, "uid_mark": uid_mark}
+            self._save()
+
+    def advance_uid_mark(self, address: str, uid: int) -> None:
+        """Raise the mailbox's UID mark to *uid* (never lowers it)."""
+        with self._lock:
+            state = self._mailboxes.setdefault((address or "").lower(), {"uidvalidity": None, "uid_mark": None})
+            if state.get("uid_mark") is not None and state["uid_mark"] >= uid:
+                return
+            state["uid_mark"] = int(uid)
+            self._save()
+
 
 def _esecret_int(name: str, default: int) -> int:
     """Scope-aware integer read."""
@@ -419,6 +608,12 @@ class EmailAdapter(BasePlatformAdapter):
         # Track the last IMAP fetch attempt so the poll loop can distinguish "checked, nothing new" from
         # "the check itself failed" (#80016).
         self._thread_context: Dict[str, Dict[str, str]] = {}
+        # (sender, thread root) -> subject, last message id and References list of that thread
+        self._root_context: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # Resolved once and logged: plugin_data_dir follows the active profile's home.
+        self._store_path = plugin_data_dir("email") / "threads.json"
+        self._store = _EmailThreadStore(self._store_path)
+        logger.info("[Email] Thread store: %s", self._store_path)
         logger.info("[Email] Adapter initialized for %s", self._address)
 
     def _trim_seen_uids(self) -> None:
@@ -737,24 +932,67 @@ class EmailAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        """Send an email reply to the given address."""
-        return await self._run_send(self._send_email, (chat_id, content, reply_to), "[Email] Send failed to %s: %s", chat_id)
+        """Send an email to the given address. ``metadata["thread_id"]`` (a root from ``create_handoff_thread`` or an
+        inbound thread) threads it under that root; ``metadata["job_id"]`` is recorded on a root's first mail."""
+        meta = metadata or {}
+        thread_key = str(meta["thread_id"]) if meta.get("thread_id") else None
+        job_id = str(meta.get("job_id") or "")
+        return await self._run_send(self._send_email, (chat_id, content, reply_to, thread_key, job_id),
+                                    "[Email] Send failed to %s: %s", chat_id)
+
+    async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
+        """Mint a thread root for *parent_chat_id* and record it as pending; no mail is sent here. The first
+        ``send`` with this id as ``metadata["thread_id"]`` goes out as a fresh mail whose Message-ID is the root
+        and whose subject comes from the content (else *name*). Returns the session-key-safe root, or ``None``."""
+        try:
+            header = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
+            key = _root_key(header)
+            self._store.add_pending_root(key, header, name, (parent_chat_id or "").strip().lower())
+            return key
+        except Exception as exc:
+            logger.warning("[Email] Handoff thread: could not record a thread root for %s: %s", parent_chat_id, exc)
+            return None
 
     def _message_id_domain(self) -> str:
         """Domain for generated Message-IDs; ``localhost`` when EMAIL_ADDRESS lacks ``@``."""
         return (self._address.rsplit("@", 1)[-1] if "@" in self._address else "") or "localhost"
 
     def _new_reply(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None, *,
-                   attach_empty_body: bool = False) -> Tuple[MIMEMultipart, str, str]:
-        """Build a threaded reply skeleton. Returns ``(msg, msg_id, subject)``."""
-        msg, ctx = MIMEMultipart(), self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
-        threading = (("In-Reply-To", original_msg_id), ("References", original_msg_id)) if original_msg_id else ()
-        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
-        for key, value in (("From", self._address), ("To", to_addr), ("Subject", subject), *threading,
+                   attach_empty_body: bool = False, thread_key: Optional[str] = None) -> Tuple[MIMEMultipart, str, str]:
+        """Build a reply skeleton. Returns ``(msg, msg_id, subject)``.
+
+        A pending thread root goes out fresh (Message-ID = the root, no In-Reply-To/References, subject from a
+        leading ``Subject:`` line else the job name); any other *thread_key* replies inside that thread with the
+        References chain from the root; no *thread_key* threads on the sender's last mail, as before."""
+        msg = MIMEMultipart()
+        root = self._store.get_root(thread_key) if thread_key else None
+        if root and root.get("pending"):
+            subject, body = _split_subject(body, _subject_from_thread_name(root.get("name")))
+            msg_id = root.get("header") or f"<{thread_key}>"
+            thread_headers: tuple = ()
+        else:
+            msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
+            if thread_key:
+                header = (root or {}).get("header") or ("" if thread_key.startswith("h-") else f"<{thread_key}>")
+                rctx = self._root_context.get((to_addr.lower(), thread_key), {})
+                subject = (rctx.get("subject") or (root or {}).get("subject")
+                           or self._thread_context.get(to_addr, {}).get("subject") or "Hermes Agent")
+                parent = reply_to_msg_id or rctx.get("message_id") or header
+                chain: List[str] = []
+                for mid in [*(rctx.get("references") or ([header] if header else [])), parent]:
+                    if mid and mid not in chain:
+                        chain.append(mid)
+                if len(chain) > _REFERENCES_MAX:
+                    chain = chain[:1] + chain[-(_REFERENCES_MAX - 1):]
+                thread_headers = (("In-Reply-To", parent), ("References", " ".join(chain))) if parent else ()
+            else:
+                ctx = self._thread_context.get(to_addr, {})
+                subject = ctx.get("subject", "Hermes Agent")
+                original_msg_id = reply_to_msg_id or ctx.get("message_id")
+                thread_headers = (("In-Reply-To", original_msg_id), ("References", original_msg_id)) if original_msg_id else ()
+            if not subject.startswith("Re:"):
+                subject = f"Re: {subject}"
+        for key, value in (("From", self._address), ("To", to_addr), ("Subject", subject), *thread_headers,
                            ("Date", formatdate(localtime=True)), ("Message-ID", msg_id)):
             msg[key] = value
         if body or attach_empty_body:
@@ -773,18 +1011,38 @@ class EmailAdapter(BasePlatformAdapter):
             except Exception:
                 smtp.close()
 
-    def _send_email(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None) -> str:
-        """Send an email via SMTP. Runs in executor thread."""
-        msg, msg_id, subject = self._new_reply(to_addr, body, reply_to_msg_id, attach_empty_body=True)
+    def _after_thread_send(self, thread_key: Optional[str], msg_id: str, subject: str, job_id: str) -> bool:
+        """After a confirmed send in a thread: a pending root is marked sent (subject, job id) and the mail is
+        indexed to its root. Returns True when this mail was the root itself. Never raises: the mail is out."""
+        if not thread_key:
+            return False
+        try:
+            was_root = self._store.is_pending(thread_key)
+            if was_root:
+                self._store.mark_sent(thread_key, subject, job_id)
+            self._store.index_message(msg_id, thread_key)
+            return was_root
+        except Exception as exc:
+            logger.warning("[Email] Could not record sent mail %s in thread %s: %s", msg_id, thread_key, exc)
+            return False
+
+    def _send_email(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None,
+                    thread_key: Optional[str] = None, job_id: str = "") -> str:
+        """Send an email via SMTP (in thread *thread_key* when given). Runs in executor thread."""
+        msg, msg_id, subject = self._new_reply(to_addr, body, reply_to_msg_id, attach_empty_body=True,
+                                               thread_key=thread_key)
         self._smtp_send(msg)
-        logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
+        if self._after_thread_send(thread_key, msg_id, subject, job_id):
+            logger.info("[Email] Sent thread root to %s (subject: %s)", to_addr, subject)
+        else:
+            logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
         return msg_id
 
     def _send_with_files(self, to_addr: str, body: str, files: List[Tuple[Path, str]], *, lenient: bool,
-                         reply_to_msg_id: Optional[str] = None) -> str:
+                         reply_to_msg_id: Optional[str] = None, thread_key: Optional[str] = None) -> str:
         """Send a reply with attachments; *lenient* logs-and-skips unattachable files instead of raising.
         An explicit *reply_to_msg_id* threads the mail like ``_send_email`` does (#10131)."""
-        msg, msg_id, _ = self._new_reply(to_addr, body, reply_to_msg_id)
+        msg, msg_id, subject = self._new_reply(to_addr, body, reply_to_msg_id, thread_key=thread_key)
         for path, name in files:
             try:
                 _attach_file(msg, path, name)
@@ -793,6 +1051,7 @@ class EmailAdapter(BasePlatformAdapter):
                     raise
                 logger.warning("[Email] Failed to attach %s: %s", path, e)
         self._smtp_send(msg)
+        self._after_thread_send(thread_key, msg_id, subject, "")
         return msg_id
 
     async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None,

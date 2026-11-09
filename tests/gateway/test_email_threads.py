@@ -317,5 +317,240 @@ class TestHtmlPart(unittest.TestCase):
         self.assertIn("<h1>All good</h1>", _html_of(msg))
 
 
+def _store_path() -> Path:
+    from plugins.plugin_storage import plugin_data_dir
+
+    return plugin_data_dir("email") / "threads.json"
+
+
+class TestThreadStore(unittest.TestCase):
+    """The persistent thread store and the one root sanitiser both ends share."""
+
+    def test_root_sanitised_for_session_key(self):
+        from gateway.session import _is_path_unsafe
+        from plugins.platforms.email.adapter import _root_key
+
+        self.assertEqual(_root_key("<hermes-abc@test.com>"), "hermes-abc@test.com")
+        self.assertEqual(_root_key("  hermes-abc@test.com "), "hermes-abc@test.com")
+        hashed = ["<a/../b@x.com>", "<a b@x.com>", "<" + "x" * 200 + "@x.com>", "<\\evil@x.com>", "<c:x@y>"]
+        for raw in hashed:
+            key = _root_key(raw)
+            self.assertTrue(key.startswith("h-"), raw)
+            self.assertEqual(len(key), 26, raw)
+            self.assertEqual(_root_key(raw), key, raw)
+        self.assertEqual(len({_root_key(raw) for raw in hashed}), len(hashed))
+        for raw in hashed + ["<hermes-abc@test.com>"]:
+            self.assertFalse(_is_path_unsafe(_root_key(raw), strict=False), raw)
+
+    def test_message_ids_parses_folded_header(self):
+        from plugins.platforms.email.adapter import _message_ids
+
+        self.assertEqual(_message_ids("<a@x>\r\n\t<b@y> junk <c@z>"), ["<a@x>", "<b@y>", "<c@z>"])
+        self.assertEqual(_message_ids(None), [])
+        self.assertEqual(_message_ids(""), [])
+
+    def test_thread_store_survives_new_adapter_instance(self):
+        first = make_adapter()
+        first._store.add_pending_root("k1", "<k1>", "Hermes — Report", "user@test.com")
+        second = make_adapter()
+        root = second._store.get_root("k1")
+        self.assertEqual(root["name"], "Hermes — Report")
+        self.assertIs(root["pending"], True)
+        self.assertTrue(second._store.is_pending("k1"))
+
+    def test_corrupt_store_resets_to_empty(self):
+        path = _store_path()
+        path.write_text("{not json", encoding="utf-8")
+        with self.assertLogs("plugins.platforms.email.adapter", "WARNING") as logs:
+            adapter = make_adapter()
+        self.assertTrue(any("threads.json" in line for line in logs.output))
+        self.assertIsNone(adapter._store.get_root("k1"))
+        adapter._store.add_pending_root("k1", "<k1>", "Hermes — Report", "user@test.com")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIn("k1", data["roots"])
+
+    def test_store_prunes_old_roots(self):
+        import time
+
+        now = time.time()
+        root = {"header": "", "name": "n", "subject": "", "job_id": "", "chat_id": "user@test.com", "pending": False}
+        _store_path().write_text(json.dumps({
+            "version": 1,
+            "roots": {"old": dict(root, header="<old>", created=now - 91 * 86400),
+                      "new": dict(root, header="<new>", created=now - 10 * 86400)},
+            "index": {"old": "old", "m-old@x": "old", "new": "new", "m-new@x": "new"},
+            "mailboxes": {},
+        }), encoding="utf-8")
+        store = make_adapter()._store
+        self.assertIsNone(store.get_root("old"))
+        self.assertIsNone(store.root_for(["<m-old@x>"]))
+        self.assertEqual(store.get_root("new")["header"], "<new>")
+        self.assertEqual(store.root_for(["<m-new@x>"]), "new")
+        store.index_message("<m2@x>", "new")  # the next write persists the pruned state
+        on_disk = json.loads(_store_path().read_text(encoding="utf-8"))
+        self.assertEqual(set(on_disk["roots"]), {"new"})
+        self.assertNotIn("m-old@x", on_disk["index"])
+        self.assertEqual(on_disk["index"]["m2@x"], "new")
+
+    def test_store_index_resolves_first_known_id(self):
+        store = make_adapter()._store
+        store.add_pending_root("k1", "<k1>", "Hermes — Report", "user@test.com")
+        store.index_message("<m2@x>", "k1")
+        self.assertEqual(store.root_for(["<unknown@x>", "<m2@x>"]), "k1")
+        self.assertEqual(store.root_for(["<k1>"]), "k1")
+        self.assertIsNone(store.root_for([]))
+        self.assertIsNone(store.root_for(["<unknown@x>"]))
+
+    def test_store_concurrent_writes_keep_valid_json(self):
+        import threading
+
+        store = make_adapter()._store
+        store.add_pending_root("k1", "<k1>", "Hermes — Report", "user@test.com")
+
+        def worker(n):
+            for i in range(50):
+                store.index_message(f"<t{n}-{i}@x>", "k1")
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        data = json.loads(_store_path().read_text(encoding="utf-8"))
+        ids = {f"t{n}-{i}@x" for n in range(4) for i in range(50)}
+        self.assertEqual(ids - set(data["index"]), set())
+        self.assertEqual(len(ids), 200)
+
+
+class TestOutboundThreads(unittest.TestCase):
+    """MAIL-01 end to end and the outbound half of MAIL-03: minted roots, fresh first mail, References chain."""
+
+    def _mint(self, adapter, name="Hermes — Report"):
+        return asyncio.run(adapter.create_handoff_thread("user@test.com", name))
+
+    def _send(self, adapter, content, **kwargs):
+        with patch("smtplib.SMTP") as mock_smtp:
+            result = asyncio.run(adapter.send("user@test.com", content, **kwargs))
+            msg = sent_message(mock_smtp) if mock_smtp.return_value.send_message.called else None
+        return result, msg
+
+    @staticmethod
+    def _plain(msg):
+        return [p for p in msg.walk() if p.get_content_type() == "text/plain"][0].get_payload(decode=True).decode("utf-8")
+
+    def test_create_handoff_thread_mints_pending_root(self):
+        import re
+
+        adapter = make_adapter()
+        key = asyncio.run(adapter.create_handoff_thread("User@Test.com", "Hermes — Report"))
+        self.assertRegex(key, r"^hermes-[0-9a-f]{12}@test\.com$")
+        root = adapter._store.get_root(key)
+        self.assertIs(root["pending"], True)
+        self.assertEqual(root["name"], "Hermes — Report")
+        self.assertEqual(root["chat_id"], "user@test.com")
+        self.assertEqual(root["header"], "<" + key + ">")
+        self.assertIsNotNone(re.fullmatch(r"[^<>\s/\\]+", key))
+
+    def test_pending_root_sent_as_fresh_mail_with_minted_message_id(self):
+        adapter = make_adapter()
+        key = self._mint(adapter)
+        result, msg = self._send(adapter, "Subject: Report — Nov 9\n\n- item", metadata={"thread_id": key, "job_id": "j1"})
+        self.assertTrue(result.success)
+        self.assertEqual(msg["Message-ID"], "<" + key + ">")
+        self.assertEqual(msg["Subject"], "Report — Nov 9")
+        self.assertIsNone(msg["In-Reply-To"])
+        self.assertIsNone(msg["References"])
+        self.assertNotIn("Subject:", self._plain(msg))
+        self.assertEqual(self._plain(msg), "- item")
+        self.assertEqual(result.message_id, "<" + key + ">")
+        root = adapter._store.get_root(key)
+        self.assertIs(root["pending"], False)
+        self.assertEqual(root["job_id"], "j1")
+        self.assertEqual(root["subject"], "Report — Nov 9")
+
+    def test_pending_root_subject_falls_back_to_job_name(self):
+        adapter = make_adapter()
+        key = self._mint(adapter)
+        _, msg = self._send(adapter, "- item", metadata={"thread_id": key, "job_id": "j1"})
+        self.assertEqual(msg["Subject"], "Report")
+        self.assertEqual(msg["Message-ID"], "<" + key + ">")
+
+    def test_pending_root_ignores_per_sender_context(self):
+        adapter = make_adapter()
+        adapter._thread_context["user@test.com"] = {"subject": "Old", "message_id": "<old@test.com>"}
+        key = self._mint(adapter)
+        _, msg = self._send(adapter, "- item", metadata={"thread_id": key, "job_id": "j1"})
+        self.assertIsNone(msg["In-Reply-To"])
+        self.assertIsNone(msg["References"])
+        self.assertNotIn("Old", msg["Subject"])
+        self.assertEqual(msg["Subject"], "Report")
+
+    def test_second_chunk_threads_under_root(self):
+        adapter = make_adapter()
+        key = self._mint(adapter)
+        meta = {"thread_id": key, "job_id": "j1"}
+        self._send(adapter, "Subject: Report — Nov 9\n\n- part one", metadata=meta)
+        result, msg = self._send(adapter, "- part two", metadata=meta)
+        self.assertEqual(msg["Subject"], "Re: Report — Nov 9")
+        self.assertEqual(msg["In-Reply-To"], "<" + key + ">")
+        self.assertEqual(msg["References"], "<" + key + ">")
+        self.assertNotEqual(msg["Message-ID"], "<" + key + ">")
+        self.assertEqual(result.message_id, msg["Message-ID"])
+        self.assertEqual(adapter._store.root_for([msg["Message-ID"]]), key)
+        self.assertEqual(adapter._store.get_root(key)["job_id"], "j1")
+
+    def test_reply_sends_full_references_chain(self):
+        adapter = make_adapter()
+        key = self._mint(adapter)
+        self._send(adapter, "Subject: Report — Nov 9\n\n- item", metadata={"thread_id": key, "job_id": "j1"})
+        root_id = "<" + key + ">"
+        adapter._root_context[("user@test.com", key)] = {
+            "subject": "Report — Nov 9", "message_id": "<r2@test.com>", "references": [root_id, "<h1@test.com>"]}
+        _, msg = self._send(adapter, "answer", reply_to="<r2@test.com>", metadata={"thread_id": key})
+        self.assertEqual(msg["In-Reply-To"], "<r2@test.com>")
+        self.assertEqual(msg["References"], f"{root_id} <h1@test.com> <r2@test.com>")
+        self.assertEqual(msg["Subject"], "Re: Report — Nov 9")
+
+    def test_references_chain_capped(self):
+        adapter = make_adapter()
+        key = self._mint(adapter)
+        self._send(adapter, "- item", metadata={"thread_id": key, "job_id": "j1"})
+        root_id = "<" + key + ">"
+        refs = [root_id] + [f"<m{i}@test.com>" for i in range(1, 40)]
+        self.assertEqual(len(refs), 40)
+        adapter._root_context[("user@test.com", key)] = {"subject": "Report", "message_id": "<m39@test.com>",
+                                                         "references": refs}
+        _, msg = self._send(adapter, "answer", reply_to="<p@test.com>", metadata={"thread_id": key})
+        ids = msg["References"].split()
+        self.assertEqual(len(ids), 20)
+        self.assertEqual(ids[0], root_id)
+        self.assertEqual(ids[1:], (refs + ["<p@test.com>"])[-19:])
+        self.assertEqual(ids[-1], "<p@test.com>")
+        self.assertEqual(msg["In-Reply-To"], "<p@test.com>")
+
+    def test_send_without_thread_unchanged(self):
+        adapter = make_adapter()
+        adapter._thread_context["user@test.com"] = {"subject": "Project question", "message_id": "<original@test.com>"}
+        result, msg = self._send(adapter, "x")
+        self.assertTrue(result.success)
+        self.assertEqual(msg["Subject"], "Re: Project question")
+        self.assertEqual(msg["In-Reply-To"], "<original@test.com>")
+        self.assertEqual(msg["References"], "<original@test.com>")
+        self.assertEqual(adapter._store.root_for([msg["Message-ID"]]), None)
+
+    def test_failed_smtp_leaves_root_pending(self):
+        adapter = make_adapter()
+        key = self._mint(adapter)
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_smtp.return_value.send_message.side_effect = OSError("smtp down")
+            result = asyncio.run(adapter.send("user@test.com", "Subject: Report\n\nbody",
+                                              metadata={"thread_id": key, "job_id": "j1"}))
+        self.assertIs(result.success, False)
+        root = adapter._store.get_root(key)
+        self.assertIs(root["pending"], True)
+        self.assertEqual(root["job_id"], "")
+        self.assertIsNone(adapter._store.root_for(["<unrelated@test.com>"]))
+
+
 if __name__ == "__main__":
     unittest.main()
