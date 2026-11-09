@@ -175,6 +175,22 @@ platforms:
 
 Off by default. When enabled, each outgoing email carries the Markdown as `text/plain` and an HTML rendering (made with markdown-it-py) as `text/html`, so mail clients show headings, lists and tables. Raw HTML in the text is escaped and images render as links, so nothing loads remotely when the mail is opened.
 
+### Conversations per Thread
+
+A continuable cron delivery to email (a job with `attach_to_session: true` and an explicit `deliver: email:<address>` target) opens a thread: each run goes out as a new mail, and replies to it continue that job's conversation, with the delivered text in context. This needs no setting.
+
+To also give every other mail thread its own conversation, add to your `config.yaml`:
+
+```yaml
+platforms:
+  email:
+    thread_sessions: true
+```
+
+Off by default. When enabled, a reply to mail Hermes didn't start gets a conversation keyed by the thread's first Message-ID, and the agent is shown the thread's subject on every turn. A new mail with no reply headers starts its own conversation too. With the setting off, such mail shares the sender's single conversation, as before.
+
+A thread is only reachable by the sender it belongs to: the conversation key includes the sender's address, so another sender replying in the same thread gets a separate conversation. Thread state is kept in `plugin-data/email/threads.json` under the profile's Hermes home, and threads older than 90 days are pruned.
+
 ---
 
 ## Access Control

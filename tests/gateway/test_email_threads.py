@@ -552,5 +552,160 @@ class TestOutboundThreads(unittest.TestCase):
         self.assertIsNone(adapter._store.root_for(["<unrelated@test.com>"]))
 
 
+class TestInboundThreads(DispatchCase):
+    """The inbound half of MAIL-03 and MAIL-04: replies resolve to their thread's root and session key."""
+
+    FOREIGN_REFS = "<foreign-root@mail.example.com> <foreign-2@mail.example.com>"
+
+    def _mint_and_send(self, adapter, content="Subject: Report\n\n- item"):
+        key = asyncio.run(adapter.create_handoff_thread("user@test.com", "Hermes — Report"))
+        self._send(adapter, content, metadata={"thread_id": key, "job_id": "j1"})
+        return key
+
+    def _send(self, adapter, content, **kwargs):
+        with patch("smtplib.SMTP") as mock_smtp:
+            result = asyncio.run(adapter.send("user@test.com", content, **kwargs))
+            msg = sent_message(mock_smtp) if mock_smtp.return_value.send_message.called else None
+        return result, msg
+
+    def _dispatch(self, adapter, **inbound):
+        events = self.capture(adapter)
+        asyncio.run(adapter._dispatch_message(adapter._parse_fetched_message(b"1", make_inbound(**inbound))))
+        return events[-1] if events else None
+
+    @staticmethod
+    def _key(source):
+        from gateway.session import build_session_key
+
+        return build_session_key(source)
+
+    def test_references_resolved_to_thread_root(self):
+        adapter = make_adapter()
+        key = self._mint_and_send(adapter)
+        event = self._dispatch(adapter, subject="Re: Report", in_reply_to=f"<{key}>", references=f"<{key}>",
+                               message_id="<r1@test.com>")
+        self.assertEqual(event.source.thread_id, key)
+        self.assertEqual(event.source.chat_id, "user@test.com")
+        self.assertEqual(event.source.chat_type, "dm")
+
+    def test_reply_to_hermes_reply_resolves_via_index(self):
+        adapter = make_adapter()
+        key = self._mint_and_send(adapter)
+        result, _ = self._send(adapter, "- part two", metadata={"thread_id": key})
+        hermes_reply = result.message_id
+        event = self._dispatch(adapter, subject="Re: Report", in_reply_to=hermes_reply,
+                               references=f"<other@elsewhere> {hermes_reply}", message_id="<r1@test.com>")
+        self.assertEqual(event.source.thread_id, key)
+
+    def test_seed_and_reply_share_session_key(self):
+        from cron.scheduler_delivery import _seed_cron_thread_session
+
+        adapter = make_adapter()
+        key = self._mint_and_send(adapter)
+        seed_adapter, store = MagicMock(), MagicMock()
+        seed_adapter._session_store = store
+        with patch("gateway.mirror.mirror_to_session", return_value=True):
+            _seed_cron_thread_session({"id": "j1", "name": "Report"}, seed_adapter, "email", "user@test.com", key,
+                                      "report")
+        store.get_or_create_session.assert_called_once()
+        seed_key = self._key(store.get_or_create_session.call_args[0][0])
+
+        first = self._dispatch(adapter, subject="Re: Report", in_reply_to=f"<{key}>", references=f"<{key}>",
+                               message_id="<r1@test.com>")
+        self.assertEqual(self._key(first.source), seed_key)
+        answer, _ = self._send(adapter, "answer", reply_to="<r1@test.com>", metadata={"thread_id": key})
+        second = self._dispatch(adapter, subject="Re: Report", in_reply_to=answer.message_id,
+                                references=f"<{key}> <r1@test.com> {answer.message_id}", message_id="<r2@test.com>")
+        self.assertEqual(self._key(second.source), seed_key)
+        # Restart: a new adapter in the same HERMES_HOME knows the thread from the persisted store alone.
+        restarted = make_adapter()
+        third = self._dispatch(restarted, subject="Re: Report", in_reply_to="<r2@test.com>",
+                               references="<r2@test.com>", message_id="<r3@test.com>")
+        self.assertEqual(self._key(third.source), seed_key)
+
+    def test_unknown_root_gets_own_session_with_subject(self):
+        adapter = make_adapter(thread_sessions=True)
+        topic = "Daily summary (thread <foreign-root@mail.example.com>)"
+        first = self._dispatch(adapter, subject="Re: Fwd: Daily summary", references=self.FOREIGN_REFS,
+                               in_reply_to="<foreign-2@mail.example.com>", message_id="<u1@test.com>")
+        self.assertEqual(first.source.thread_id, "foreign-root@mail.example.com")
+        self.assertEqual(first.source.chat_topic, topic)
+        self.assertEqual(adapter._store.get_root("foreign-root@mail.example.com")["subject"], "Daily summary")
+        second = self._dispatch(adapter, subject="Re: something else", references=self.FOREIGN_REFS,
+                                message_id="<u2@test.com>")
+        self.assertEqual(second.source.thread_id, "foreign-root@mail.example.com")
+        self.assertEqual(second.source.chat_topic, topic)
+
+    def test_own_message_id_session_for_new_mail(self):
+        adapter = make_adapter(thread_sessions=True)
+        event = self._dispatch(adapter, subject="Plan for Friday", message_id="<new-1@test.com>")
+        self.assertEqual(event.source.thread_id, "new-1@test.com")
+        self.assertTrue(event.source.chat_topic.startswith("Plan for Friday"))
+
+    def test_flag_off_keeps_flat_session(self):
+        adapter = make_adapter()
+        event = self._dispatch(adapter, subject="Re: Fwd: Daily summary", references=self.FOREIGN_REFS,
+                               in_reply_to="<foreign-2@mail.example.com>", message_id="<u1@test.com>")
+        self.assertIsNone(event.source.thread_id)
+        self.assertIsNone(event.source.chat_topic)
+        self.assertTrue(self._key(event.source).endswith(":email:dm:user@test.com"))
+        self.assertIsNone(adapter._store.get_root("foreign-root@mail.example.com"))
+
+    def test_hermes_root_routes_with_flag_off(self):
+        adapter = make_adapter()
+        key = self._mint_and_send(adapter)
+        event = self._dispatch(adapter, subject="Re: Report", in_reply_to=f"<{key}>", message_id="<r1@test.com>")
+        self.assertEqual(event.source.thread_id, key)
+        self.assertEqual(event.source.chat_topic, f"Report (thread <{key}>)")
+
+    def test_thread_from_other_sender_gets_different_key(self):
+        adapter = make_adapter()
+        key = self._mint_and_send(adapter)
+        own = self._dispatch(adapter, subject="Re: Report", references=f"<{key}>", message_id="<r1@test.com>")
+        other = self._dispatch(adapter, sender="Other <other@test.com>", subject="Re: Report",
+                               references=f"<{key}>", message_id="<o1@test.com>")
+        self.assertEqual(other.source.thread_id, key)
+        self.assertNotEqual(self._key(other.source), self._key(own.source))
+        self.assertIn(":dm:other@test.com:", self._key(other.source))
+
+    def test_crafted_message_id_cannot_escape_session_key(self):
+        from gateway.session import _is_path_unsafe
+
+        adapter = make_adapter(thread_sessions=True)
+        event = self._dispatch(adapter, subject="Re: x", references="<../../etc/passwd@x>", message_id="<c1@test.com>")
+        self.assertTrue(event.source.thread_id.startswith("h-"))
+        self.assertFalse(_is_path_unsafe(self._key(event.source), strict=False))
+
+    def test_sender_case_normalised(self):
+        adapter = make_adapter()
+        event = self._dispatch(adapter, sender="User <USER@Test.COM>")
+        self.assertEqual(event.source.chat_id, "user@test.com")
+
+    def test_reply_in_thread_chains_references_from_inbound(self):
+        adapter = make_adapter()
+        key = self._mint_and_send(adapter)
+        self._dispatch(adapter, subject="Re: Report", in_reply_to=f"<{key}>", references=f"<{key}>",
+                       message_id="<r1@test.com>")
+        _, msg = self._send(adapter, "answer", reply_to="<r1@test.com>", metadata={"thread_id": key})
+        self.assertEqual(msg["References"], f"<{key}> <r1@test.com>")
+        self.assertEqual(msg["In-Reply-To"], "<r1@test.com>")
+        self.assertEqual(msg["Subject"], "Re: Report")
+
+    def test_rejected_sender_never_touches_store(self):
+        adapter = make_adapter(thread_sessions=True)
+        key = self._mint_and_send(adapter)
+        index_before, file_before = dict(adapter._store._index), _store_path().read_text(encoding="utf-8")
+        with patch.dict(os.environ, {}):
+            for name in ("EMAIL_ALLOW_ALL_USERS", "GATEWAY_ALLOW_ALL_USERS", "EMAIL_ALLOWED_USERS",
+                         "GATEWAY_ALLOWED_USERS"):
+                os.environ.pop(name, None)
+            event = self._dispatch(adapter, sender="Stranger <stranger@elsewhere.com>", subject="Re: Report",
+                                   in_reply_to=f"<{key}>", references=f"<{key}>", message_id="<s1@elsewhere.com>")
+        self.assertIsNone(event)
+        self.assertEqual(adapter._store._index, index_before)
+        self.assertEqual(_store_path().read_text(encoding="utf-8"), file_before)
+        self.assertEqual(adapter._root_context, {})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,6 @@
 """Email platform adapter for the Hermes gateway: users talk to Hermes by sending email; IMAP (polled)
-receives, SMTP sends. Configured via EMAIL_* env vars or ``platforms.email`` in config.yaml (see website docs)."""
+receives, SMTP sends. Configured via EMAIL_* env vars or ``platforms.email`` in config.yaml (see website docs).
+Cron deliveries can open mail threads (``create_handoff_thread``), and replies are routed per thread (see the user guide)."""
 
 import asyncio
 import email as email_lib
@@ -136,6 +137,16 @@ def _root_key(raw: str) -> str:
 def _bare_id(message_id: Optional[str]) -> str:
     """A Message-ID without surrounding whitespace and ``<>`` (the store's index key)."""
     return (message_id or "").strip().strip("<>").strip()
+
+
+_REPLY_PREFIX_RE = re.compile(r"^(?:\s*(?:re|fwd|fw)\s*:)+\s*", re.IGNORECASE)
+
+
+def _strip_reply_prefix(subject: str) -> str:
+    """A thread's subject from a reply's: leading ``Re:``/``Fwd:``/``Fw:`` (any case, repeated) removed, control
+    characters dropped, capped like other subjects; ``"(no subject)"`` when nothing is left."""
+    subject = re.sub(r"[\r\x00-\x1f\x7f]", " ", subject or "")
+    return _REPLY_PREFIX_RE.sub("", subject).strip()[:_MAX_SUBJECT_LEN] or "(no subject)"
 
 
 class _EmailThreadStore:
@@ -592,6 +603,7 @@ class EmailAdapter(BasePlatformAdapter):
         self._poll_interval = _esecret_int("EMAIL_POLL_INTERVAL", 15)
         self._skip_attachments = extra.get("skip_attachments", False)  # platforms.email.skip_attachments
         self._html = is_truthy_value(extra.get("html"), default=False)  # platforms.email.html: add a text/html part rendered from Markdown
+        self._thread_sessions = is_truthy_value(extra.get("thread_sessions"), default=False)  # platforms.email.thread_sessions: own session per thread for mail Hermes didn't thread
         # Require an authenticated From: domain (SPF/DKIM/DMARC) before trusting it for authorization
         # (GHSA-rxqh-5572-8m77). Default ON; opt out via require_authenticated_sender: false / EMAIL_TRUST_FROM_HEADER=true.
         if "require_authenticated_sender" in extra:
@@ -826,6 +838,7 @@ class EmailAdapter(BasePlatformAdapter):
         sender_authenticated, auth_reason = _verify_sender_authentication(msg, sender_addr, authserv_id=self._authserv_id)
         return {"uid": uid, "sender_addr": sender_addr, "sender_name": sender_name, "subject": subject,
                 "message_id": msg.get("Message-ID", ""), "in_reply_to": msg.get("In-Reply-To", ""),
+                "references": msg.get("References", "") or "",
                 "body": _extract_text_body(msg),
                 "attachments": _extract_attachments(msg, skip_attachments=self._skip_attachments),
                 "date": msg.get("Date", ""), "sender_authenticated": sender_authenticated, "auth_reason": auth_reason}
@@ -912,16 +925,46 @@ class EmailAdapter(BasePlatformAdapter):
         # of message_type, but document-context injection gates strictly on MessageType.DOCUMENT — so DOCUMENT surfaces both.
         kinds = {att["type"] for att in attachments}
         self._thread_context[sender_addr] = {"subject": subject, "message_id": msg_data["message_id"]}
+        # Only after _sender_accepted: resolving may write the store, and strangers must not reach it.
+        key, header, topic = self._resolve_thread(msg_data)
+        if key:
+            own = msg_data["message_id"]
+            self._store.index_message(own, key)
+            refs = _message_ids(msg_data.get("references")) or ([header] if header and header != own.strip() else [])
+            self._root_context[(sender_addr, key)] = {"subject": topic, "message_id": own, "references": refs}
         name = msg_data["sender_name"] or sender_addr
         event = MessageEvent(
             text=text or "(empty email)", message_id=msg_data["message_id"],
             message_type=MessageType.DOCUMENT if "document" in kinds else MessageType.PHOTO if "image" in kinds else MessageType.TEXT,
             source=self.build_source(chat_id=sender_addr, chat_name=name, chat_type="dm", user_id=sender_addr, user_name=name,
-                                     message_id=msg_data["message_id"]),
+                                     message_id=msg_data["message_id"], thread_id=key,
+                                     chat_topic=f"{topic} (thread {header})" if key else None),
             media_urls=[att["path"] for att in attachments], media_types=[att["media_type"] for att in attachments],
             reply_to_message_id=msg_data["in_reply_to"] or None)
         logger.info("[Email] New message from %s: %s", sender_addr, subject)
         await self.handle_message(event)
+
+    def _resolve_thread(self, msg_data: Dict[str, Any]) -> Tuple[Optional[str], str, str]:
+        """``(root key, root Message-ID, thread subject)`` for an accepted inbound mail, or ``(None, "", "")`` for
+        today's flat per-sender session. A root the store knows (any id in References, then In-Reply-To) always
+        routes, as Hermes only mints roots when cron asked for a thread. With ``thread_sessions`` on, any other
+        thread is keyed by its first References entry, else In-Reply-To, else the mail's own Message-ID."""
+        subject = msg_data.get("subject") or ""
+        refs = _message_ids(msg_data.get("references"))
+        irt = [mid for mid in _message_ids(msg_data.get("in_reply_to")) if mid not in refs]
+        key = self._store.root_for(refs + irt)
+        if key:
+            root = self._store.get_root(key) or {}
+            return key, root.get("header") or f"<{key}>", root.get("subject") or _strip_reply_prefix(subject)
+        if not self._thread_sessions:
+            return None, "", ""
+        header = refs[0] if refs else irt[0] if irt else (_message_ids(msg_data.get("message_id")) or [""])[0]
+        if not header:
+            return None, "", ""
+        key = _root_key(header)
+        self._store.remember_root(key, header, _strip_reply_prefix(subject))
+        stored = self._store.get_root(key) or {}
+        return key, header, stored.get("subject") or _strip_reply_prefix(subject)
 
     async def _run_send(self, fn, args: tuple, log_fmt: str, *log_args) -> SendResult:
         """Run a blocking SMTP sender in the executor; wrap its Message-ID in a SendResult."""
