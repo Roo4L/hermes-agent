@@ -191,6 +191,14 @@ Off by default. When enabled, a reply to mail Hermes didn't start gets a convers
 
 A thread is only reachable by the sender it belongs to: the conversation key includes the sender's address, so another sender replying in the same thread gets a separate conversation. Thread state is kept in `plugin-data/email/threads.json` under the profile's Hermes home, and threads older than 90 days are pruned.
 
+Some sending services (Amazon SES and services built on it) replace the Message-ID of every mail they deliver. Some clients reply naming only that delivered id, with no earlier ids in `References`. So that such a reply still continues its thread, Hermes reads the headers of the mail in the account's Sent folder while it has threads, and records each mail's delivered Message-ID with the thread the mail was sent in. It reads only headers, never changes the folder, and finds the folder by its IMAP `\Sent` flag or a common name. To name the folder, or to turn the lookup off, set:
+
+```yaml
+platforms:
+  email:
+    sent_folder: "Sent Items"   # or false
+```
+
 ---
 
 ## Access Control

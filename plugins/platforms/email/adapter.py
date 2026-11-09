@@ -118,6 +118,11 @@ _ROOT_KEY_MAX = 120
 _THREAD_TTL_SECONDS = 90 * 86400  # thread roots (and the ids indexed to them) older than this are pruned on load
 _INDEX_MAX = 5000  # message-id -> root entries kept; the oldest go first
 _REFERENCES_MAX = 20  # ids in an outgoing References header: the root plus the newest 19
+_SENT_BACKFILL_MAX = 200  # Sent-folder copies read back on the first poll (the newest ones)
+_SENT_FOLDER_NAMES = ("Sent", "Sent Items", "Sent Messages", "Sent Mail", "INBOX.Sent")  # without SPECIAL-USE
+_SENT_HEADERS_FETCH = "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES)])"
+_LIST_LINE_RE = re.compile(r'^\((?P<flags>[^)]*)\)\s+(?:"(?:[^"\\]|\\.)*"|NIL)\s+(?P<name>.+)$', re.IGNORECASE)
+_FETCH_UID_RE = re.compile(rb"\bUID\s+(\d+)", re.IGNORECASE)
 
 
 def _message_ids(header: Optional[str]) -> List[str]:
@@ -137,6 +142,47 @@ def _root_key(raw: str) -> str:
 def _bare_id(message_id: Optional[str]) -> str:
     """A Message-ID without surrounding whitespace and ``<>`` (the store's index key)."""
     return (message_id or "").strip().strip("<>").strip()
+
+
+def _quote_mailbox(name: str) -> str:
+    """A mailbox name as an IMAP quoted string (imaplib sends arguments as they are)."""
+    return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _find_sent_folder(imap: Any) -> Optional[str]:
+    """The Sent mailbox: the one LIST flags ``\\Sent`` (RFC 6154), else one with a common Sent name, else ``None``."""
+    status, lines = imap.list()
+    if status != "OK":
+        return None
+    by_name: Dict[str, str] = {}
+    for line in lines or ():
+        if not isinstance(line, (bytes, bytearray)):
+            continue  # a name sent as a literal: not worth the parsing
+        match = _LIST_LINE_RE.match(bytes(line).decode("utf-8", "replace").strip())
+        if not match:
+            continue
+        name = match["name"].strip()
+        if len(name) >= 2 and name[0] == name[-1] == '"':
+            name = re.sub(r"\\(.)", r"\1", name[1:-1])
+        if "\\sent" in match["flags"].lower().split():
+            return name
+        by_name.setdefault(name.lower(), name)
+    return next((by_name[n.lower()] for n in _SENT_FOLDER_NAMES if n.lower() in by_name), None)
+
+
+def _sent_copies(data: Any) -> List[Tuple[str, List[str], List[str]]]:
+    """``(Message-ID, In-Reply-To ids, References ids)`` of each message in a header FETCH response, by UID."""
+    copies = []
+    for n, item in enumerate(data or ()):
+        if not isinstance(item, tuple) or len(item) < 2 or not isinstance(item[1], (bytes, bytearray)):
+            continue
+        match = _FETCH_UID_RE.search(item[0]) if isinstance(item[0], (bytes, bytearray)) else None
+        headers = email_lib.message_from_bytes(bytes(item[1]))
+        own = _message_ids(str(headers.get("Message-ID") or ""))
+        if own:
+            copies.append((int(match.group(1)) if match else n, own[0], _message_ids(str(headers.get("In-Reply-To") or "")),
+                           _message_ids(str(headers.get("References") or ""))))
+    return [copy[1:] for copy in sorted(copies, key=lambda c: c[0])]
 
 
 def _uid_int(uid: Any) -> int:
@@ -298,6 +344,36 @@ class _EmailThreadStore:
         with self._lock:
             self._set_index(message_id, key)
             self._save()
+
+    def has_roots(self) -> bool:
+        with self._lock:
+            return bool(self._roots)
+
+    def learn_delivered_ids(self, copies: List[Tuple[str, List[str], List[str]]]) -> int:
+        """Index the Message-ID a mail was delivered under (``(id, In-Reply-To ids, References ids)`` of its copy in
+        the Sent folder, oldest first) to the thread it was sent in: the root of its In-Reply-To, else of the first
+        known References id. Some providers replace the Message-ID the adapter wrote, and a reply that names only
+        the delivered id would otherwise open a new thread. The learned id wins over a root a reply minted from
+        that id while it was unknown (the root and its own mail stay); an id the adapter indexed to another root
+        when it sent or received the mail is left alone. Idempotent; returns the number of ids (re)indexed."""
+        learned = 0
+        with self._lock:
+            for message_id, in_reply_to, references in copies:
+                mid = _bare_id(message_id)
+                if not mid:
+                    continue
+                key = next((k for parent in [*in_reply_to, *references] if _bare_id(parent) != mid
+                            and (k := self._index.get(_bare_id(parent))) in self._roots), None)
+                current = self._index.get(mid)
+                if key is None or current == key:
+                    continue
+                if current in self._roots and current != _root_key(f"<{mid}>"):
+                    continue
+                self._set_index(mid, key)
+                learned += 1
+            if learned:
+                self._save()
+        return learned
 
     def root_for(self, ids: List[str]) -> Optional[str]:
         """The root of the first id in *ids* (in order) that the index maps to a known root."""
@@ -629,6 +705,13 @@ class EmailAdapter(BasePlatformAdapter):
         self._skip_attachments = extra.get("skip_attachments", False)  # platforms.email.skip_attachments
         self._html = is_truthy_value(extra.get("html"), default=False)  # platforms.email.html: add a text/html part rendered from Markdown
         self._thread_sessions = is_truthy_value(extra.get("thread_sessions"), default=False)  # platforms.email.thread_sessions: own session per thread for mail Hermes didn't thread
+        # platforms.email.sent_folder: where the provider files sent mail (read back for the Message-ID it delivered
+        # each one under); unset = found by LIST, false/"off" = not read.
+        sent = extra.get("sent_folder")
+        off = sent is False or (isinstance(sent, str) and sent.strip().lower() in {"off", "false", "no", "none"})
+        self._sent_folder: Optional[str] = None if off or not isinstance(sent, str) else sent.strip() or None
+        self._sent_lookup = not off and self._sent_folder is None  # find the folder by LIST on first use
+        self._sent_mark: Optional[Tuple[Optional[str], int]] = None  # (UIDVALIDITY, highest UID read) this process
         # Require an authenticated From: domain (SPF/DKIM/DMARC) before trusting it for authorization
         # (GHSA-rxqh-5572-8m77). Default ON; opt out via require_authenticated_sender: false / EMAIL_TRUST_FROM_HEADER=true.
         if "require_authenticated_sender" in extra:
@@ -827,6 +910,8 @@ class EmailAdapter(BasePlatformAdapter):
         self._fetched_max_uid = 0  # highest UID fetched OK this call; _check_inbox moves the stored mark past it
         try:
             with self._inbox() as imap:
+                if self._learn_delivered_ids(imap):
+                    imap.select("INBOX")
                 status, data = imap.uid("search", None, "UNSEEN")
                 for uid in (data[0].split() if status == "OK" and data and data[0] else []):
                     if uid in self._seen_uids:
@@ -866,6 +951,46 @@ class EmailAdapter(BasePlatformAdapter):
         # Keep the reconnect snapshot current so a mid-outage adapter recreation does not re-dispatch messages already processed.
         self._seen_uids_snapshot[self._address] = set(self._seen_uids)
         return results
+
+    def _learn_delivered_ids(self, imap: "imaplib.IMAP4") -> bool:
+        """Read the copies of sent mail new in the Sent folder (the newest ``_SENT_BACKFILL_MAX`` on the first poll)
+        and index the Message-ID each was delivered under to its thread (``learn_delivered_ids``). Runs before the
+        INBOX search so a reply in the same poll already routes. Only while the store has thread roots; a missing
+        folder turns it off for this adapter. Never raises. Returns True when another mailbox was selected."""
+        if not (self._sent_folder or self._sent_lookup) or not self._store.has_roots():
+            return False
+        selected = False
+        try:
+            if self._sent_folder is None:
+                self._sent_lookup = False
+                self._sent_folder = _find_sent_folder(imap)
+                if self._sent_folder is None:
+                    logger.info("[Email] No Sent folder found; replies naming only a provider-assigned Message-ID "
+                                "are not matched to their thread (set platforms.email.sent_folder to name it)")
+                    return False
+            selected = True
+            status, _ = imap.select(_quote_mailbox(self._sent_folder), readonly=True)
+            if status != "OK":
+                return True
+            validity = _uidvalidity(imap)
+            mark = self._sent_mark[1] if self._sent_mark and self._sent_mark[0] == validity else None
+            status, data = imap.uid("search", None, "ALL" if mark is None else f"UID {mark + 1}:*")
+            uids = [u for u in (data[0].split() if status == "OK" and data and data[0] else []) if _uid_int(u) > (mark or 0)]
+            if mark is None:
+                uids = sorted(uids, key=_uid_int)[-_SENT_BACKFILL_MAX:]
+            learned = 0
+            if uids:
+                status, data = imap.uid("fetch", ",".join(u.decode("ascii") if isinstance(u, bytes) else str(u) for u in uids),
+                                        _SENT_HEADERS_FETCH)
+                if status != "OK":
+                    return True
+                learned = self._store.learn_delivered_ids(_sent_copies(data))
+            self._sent_mark = (validity, max([mark or 0, *(_uid_int(u) for u in uids)]))
+            if learned:
+                logger.info("[Email] Indexed %d delivered Message-ID(s) of sent mail from %s", learned, self._sent_folder)
+        except Exception as exc:
+            logger.warning("[Email] Could not read the Sent folder for delivered Message-IDs: %s", exc)
+        return selected
 
     def _parse_fetched_message(self, uid: bytes, raw_email: "bytes | bytearray") -> Optional[Dict[str, Any]]:
         """Parse one RFC822 payload into a dispatchable dict; ``None`` for automated senders. Raises on pathological input (caller logs + continues)."""

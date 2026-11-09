@@ -888,5 +888,306 @@ class TestColdStart(DispatchCase):
         self.assertEqual(self._state(), ("42", 3))
 
 
+def fake_folders(folders, *, inbox_unseen=None, list_lines=None):
+    """A MagicMock IMAP connection with several folders.
+
+    *folders* maps a mailbox name to ``{"uidvalidity": bytes, "messages": {uid bytes: raw bytes}}``; ``select``
+    switches the folder that ``uid("search"|"fetch", ...)`` answers for. ``uid("search", None, "UNSEEN")``
+    returns *inbox_unseen* (INBOX only), ``"ALL"`` every UID, ``"UID n:*"`` the UIDs from n (or the last UID).
+    A fetch takes a comma-separated UID set and returns the stored bytes. ``list()`` returns *list_lines*
+    (default: one line per folder, ``\\Sent`` on the one named ``Sent``). ``imap.selected`` records each
+    selected name in order.
+    """
+    imap = MagicMock()
+    imap.selected = []
+    state = {"box": None}
+
+    def unquote(name):
+        name = str(name)
+        return name[1:-1].replace('\\"', '"').replace("\\\\", "\\") if name.startswith('"') else name
+
+    def select(name="INBOX", readonly=False):
+        name = unquote(name)
+        imap.selected.append(name)
+        if name not in folders:
+            state["box"] = None
+            return ("NO", [b"no such mailbox"])
+        state["box"] = name
+        return ("OK", [str(len(folders[name].get("messages", {}))).encode()])
+
+    def uid_handler(command, *args):
+        box = folders.get(state["box"])
+        if box is None:
+            return ("NO", [])
+        messages = box.get("messages", {})
+        uids = sorted(messages, key=int)
+        command = str(command).lower()
+        if command == "search":
+            criteria = " ".join(str(a) for a in args if a is not None).upper()
+            if "UNSEEN" in criteria:
+                return ("OK", [inbox_unseen if state["box"] == "INBOX" and inbox_unseen is not None else b""])
+            if criteria.startswith("UID "):
+                low = int(criteria.split()[1].split(":")[0])
+                hits = [u for u in uids if int(u) >= low] or uids[-1:]
+                return ("OK", [b" ".join(hits)])
+            if "ALL" in criteria:
+                return ("OK", [b" ".join(uids)])
+            return ("NO", [])
+        if command == "fetch" and args:
+            wanted = [_as_bytes(u) for u in _as_bytes(args[0]).split(b",")]
+            data = []
+            for uid in wanted:
+                if uid in messages:
+                    data.append((b"%s (UID %s BODY[HEADER] {1}" % (uid, uid), messages[uid]))
+                    data.append(b")")
+            return ("OK", data) if data else ("NO", [])
+        return ("NO", [])
+
+    imap.select.side_effect = select
+    imap.uid.side_effect = uid_handler
+    imap.response.side_effect = lambda name: (name, [folders.get(state["box"], {}).get("uidvalidity", b"7")])
+    if list_lines is None:
+        list_lines = [(b'(\\HasNoChildren \\Sent) "/" "%s"' if name == "Sent" else b'(\\HasNoChildren) "/" "%s"')
+                      % name.encode() for name in folders]
+    imap.list.return_value = ("OK", list_lines)
+    imap.login.return_value = ("OK", [b""])
+    imap.logout.return_value = ("OK", [b""])
+    return imap
+
+
+def delivered_copy(sent, message_id):
+    """The header bytes a provider files in the Sent folder for *sent*: its own Message-ID replaced by
+    *message_id*, In-Reply-To and References as the adapter wrote them."""
+    copy = MIMEText("", "plain", "utf-8")
+    copy["From"] = sent["From"]
+    copy["To"] = sent["To"]
+    copy["Subject"] = sent["Subject"]
+    copy["Message-ID"] = message_id
+    for name in ("In-Reply-To", "References"):
+        if sent[name] is not None:
+            copy[name] = sent[name]
+    return copy.as_bytes()
+
+
+class TestDeliveredMessageIds(DispatchCase):
+    """A provider that replaces the Message-ID of every mail Hermes sends (Amazon SES and services built on it)
+    still keeps the thread: the adapter reads each delivered id back from the Sent folder and indexes it to the
+    thread the mail was sent in, so a reply that names only that id (In-Reply-To, short References) routes."""
+
+    def _send(self, adapter, content, **kwargs):
+        with patch("smtplib.SMTP") as mock_smtp:
+            result = asyncio.run(adapter.send("user@test.com", content, **kwargs))
+            msg = sent_message(mock_smtp)
+        return result, msg
+
+    def _dispatch(self, adapter, **inbound):
+        events = self.capture(adapter)
+        asyncio.run(adapter._dispatch_message(adapter._parse_fetched_message(b"1", make_inbound(**inbound))))
+        return events[-1] if events else None
+
+    def _poll(self, adapter, imap):
+        events = self.capture(adapter)
+        with patch.object(adapter, "_connect_imap", return_value=imap):
+            asyncio.run(adapter._check_inbox())
+        return events
+
+    def _thread(self, adapter, tag=""):
+        """A minted thread with its root mail and one answer to a reply, as the provider delivered them.
+        Returns ``(key, root copy id, answer copy id, sent folder messages)``."""
+        key = asyncio.run(adapter.create_handoff_thread("user@test.com", "Hermes — Report"))
+        _, root_msg = self._send(adapter, "Subject: Report\n\n- item", metadata={"thread_id": key, "job_id": "j1"})
+        root_copy = f"<0100-root{tag}-000000@email.example.com>"
+        self._dispatch(adapter, subject="Re: Report", in_reply_to=root_copy, references=f"<{key}> {root_copy}",
+                       message_id=f"<r1{tag}@test.com>")
+        _, answer = self._send(adapter, "answer", reply_to=f"<r1{tag}@test.com>", metadata={"thread_id": key})
+        answer_copy = f"<0100-answer{tag}-000000@email.example.com>"
+        sent = {b"7": delivered_copy(root_msg, root_copy), b"8": delivered_copy(answer, answer_copy)}
+        return key, root_copy, answer_copy, sent
+
+    def test_poll_learns_delivered_ids_of_sent_mail(self):
+        adapter = make_adapter()
+        key, root_copy, answer_copy, sent = self._thread(adapter)
+        self.assertIsNone(adapter._store.root_for([answer_copy]))
+        imap = fake_folders({"INBOX": {}, "Sent": {"messages": sent}})
+        self._poll(adapter, imap)
+        self.assertEqual(adapter._store.root_for([answer_copy]), key)
+        self.assertEqual(adapter._store.root_for([root_copy]), key)
+        # Read-only: the Sent folder is examined, then INBOX is selected again for the UNSEEN search.
+        imap.select.assert_any_call('"Sent"', readonly=True)
+        self.assertEqual(imap.selected[-1], "INBOX")
+        on_disk = json.loads(_store_path().read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["index"][answer_copy.strip("<>")], key)
+
+    def test_reply_naming_only_delivered_id_routes_to_thread(self):
+        for tag, extra in (("a", {}), ("b", {"thread_sessions": True})):
+            with self.subTest(extra=extra):
+                adapter = make_adapter(**extra)
+                key, _, answer_copy, sent = self._thread(adapter, tag)
+                seed = self._dispatch(adapter, subject="Re: Report", in_reply_to=f"<{key}>", references=f"<{key}>",
+                                      message_id=f"<seed{tag}@test.com>")
+                self._poll(adapter, fake_folders({"INBOX": {}, "Sent": {"messages": sent}}))
+                for n, headers in enumerate(({"in_reply_to": answer_copy},
+                                             {"in_reply_to": answer_copy, "references": answer_copy})):
+                    event = self._dispatch(adapter, subject="Re: Re: Report", message_id=f"<short{tag}{n}@test.com>",
+                                           **headers)
+                    self.assertEqual(event.source.thread_id, key)
+                    self.assertEqual(build_key(event.source), build_key(seed.source))
+
+    def test_same_poll_reply_routes(self):
+        # The Sent copy and the reply to it are both new in one poll: the Sent folder is read first.
+        adapter = make_adapter()
+        key, _, answer_copy, sent = self._thread(adapter)
+        reply = make_inbound(subject="Re: Report", in_reply_to=answer_copy, references=answer_copy,
+                             message_id="<late@test.com>")
+        imap = fake_folders({"INBOX": {"messages": {b"3": reply}}, "Sent": {"messages": sent}}, inbox_unseen=b"3")
+        events = self._poll(adapter, imap)
+        self.assertEqual([e.source.thread_id for e in events], [key])
+
+    def test_startup_backfill_is_bounded_and_idempotent(self):
+        from plugins.platforms.email import adapter as mod
+
+        first = make_adapter()
+        key, _, answer_copy, sent = self._thread(first)
+        older = {str(n).encode(): delivered_copy(MIMEText("x"), f"<old-{n}@email.example.com>") for n in range(1, 7)}
+        # A restart: the new adapter has never seen the Sent folder and reads back its newest copies.
+        restarted = make_adapter()
+        imap = fake_folders({"INBOX": {}, "Sent": {"messages": {**older, **sent}}})
+        with patch.object(mod, "_SENT_BACKFILL_MAX", 3):
+            self._poll(restarted, imap)
+        fetched = [c.args[1] for c in imap.uid.call_args_list if str(c.args[0]).lower() == "fetch"]
+        self.assertEqual(fetched, ["6,7,8"])
+        self.assertEqual(restarted._store.root_for([answer_copy]), key)
+        before = _store_path().read_bytes()
+        # The next polls only look at UIDs above the last one read, and learning again changes nothing.
+        imap.uid.reset_mock()
+        self._poll(restarted, imap)
+        self.assertFalse([c for c in imap.uid.call_args_list if str(c.args[0]).lower() == "fetch"])
+        self.assertEqual(_store_path().read_bytes(), before)
+        again = make_adapter()
+        self._poll(again, fake_folders({"INBOX": {}, "Sent": {"messages": sent}}))
+        self.assertEqual(_store_path().read_bytes(), before)
+
+    def test_backfill_learns_mail_sent_outside_a_thread_send(self):
+        # A mail sent without the thread id (e.g. a document) that replies inside a known thread joins that thread.
+        adapter = make_adapter()
+        key, _, _, sent = self._thread(adapter)
+        with patch("smtplib.SMTP") as mock_smtp:
+            asyncio.run(adapter._dispatch_message(adapter._parse_fetched_message(b"2", make_inbound(
+                subject="Re: Report", in_reply_to="<r1@test.com>", references=f"<{key}> <r1@test.com>",
+                message_id="<r2@test.com>"))))
+            adapter._send_email("user@test.com", "file follows")
+            doc = sent_message(mock_smtp)
+        doc_copy = "<0100-doc-000000@email.example.com>"
+        sent[b"9"] = delivered_copy(doc, doc_copy)
+        self._poll(adapter, fake_folders({"INBOX": {}, "Sent": {"messages": sent}}))
+        self.assertEqual(adapter._store.root_for([doc_copy]), key)
+
+    def test_learned_id_wins_over_root_minted_from_it(self):
+        from plugins.platforms.email.adapter import _root_key
+
+        adapter = make_adapter(thread_sessions=True)
+        key, _, answer_copy, sent = self._thread(adapter)
+        # Before the id is known, a short reply opens its own root keyed by that id (the fork).
+        fork = self._dispatch(adapter, subject="Re: Report", in_reply_to=answer_copy, references=answer_copy,
+                              message_id="<f1@test.com>")
+        fork_key = _root_key(answer_copy)
+        self.assertEqual(fork.source.thread_id, fork_key)
+        self._poll(adapter, fake_folders({"INBOX": {}, "Sent": {"messages": sent}}))
+        self.assertEqual(adapter._store.root_for([answer_copy]), key)
+        later = self._dispatch(adapter, subject="Re: Report", in_reply_to=answer_copy, references=answer_copy,
+                               message_id="<f2@test.com>")
+        self.assertEqual(later.source.thread_id, key)
+        # The fork's root and its own mail stay: nothing is deleted.
+        self.assertIsNotNone(adapter._store.get_root(fork_key))
+        self.assertEqual(adapter._store.root_for(["<f1@test.com>"]), fork_key)
+
+    def test_send_record_beats_sent_folder(self):
+        # An id the adapter itself indexed when sending (a provider that keeps Message-IDs) is not re-pointed.
+        adapter = make_adapter()
+        key, _, _, sent = self._thread(adapter)
+        other = asyncio.run(adapter.create_handoff_thread("user@test.com", "Hermes — Other"))
+        self._send(adapter, "Subject: Other\n\nx", metadata={"thread_id": other})
+        other_reply, _ = self._send(adapter, "more", metadata={"thread_id": other})
+        kept = other_reply.message_id
+        self.assertEqual(adapter._store.root_for([kept]), other)
+        # The copy keeps its Message-ID but claims to reply into the first thread.
+        copy = MIMEText("")
+        copy["Message-ID"], copy["In-Reply-To"] = kept, "<r1@test.com>"
+        sent[b"9"] = copy.as_bytes()
+        self._poll(adapter, fake_folders({"INBOX": {}, "Sent": {"messages": sent}}))
+        self.assertEqual(adapter._store.root_for([kept]), other)
+
+    def test_in_reply_to_decides_before_references(self):
+        store = make_adapter()._store
+        store.add_pending_root("a", "<a>", "A", "user@test.com")
+        store.add_pending_root("b", "<b>", "B", "user@test.com")
+        store.index_message("<in-b@test.com>", "b")
+        copies = [("<d1@x>", ["<in-b@test.com>"], ["<a>", "<in-b@test.com>"]),
+                  ("<d2@x>", [], ["<a>", "<in-b@test.com>"]),
+                  ("<d3@x>", ["<unknown@x>"], []),
+                  ("<a>", [], ["<a>"])]
+        self.assertEqual(store.learn_delivered_ids(copies), 2)
+        self.assertEqual(store.root_for(["<d1@x>"]), "b")
+        self.assertEqual(store.root_for(["<d2@x>"]), "a")
+        self.assertIsNone(store.root_for(["<d3@x>"]))
+        self.assertEqual(store.learn_delivered_ids(copies), 0)
+
+    def test_no_thread_roots_no_sent_folder_traffic(self):
+        adapter = make_adapter()
+        imap = fake_folders({"INBOX": {}, "Sent": {"messages": {}}})
+        self._poll(adapter, imap)
+        imap.list.assert_not_called()
+        self.assertEqual(imap.selected, ["INBOX"])
+
+    def test_sent_folder_found_by_name_without_special_use(self):
+        adapter = make_adapter()
+        key, _, answer_copy, sent = self._thread(adapter)
+        imap = fake_folders({"INBOX": {}, "Sent Items": {"messages": sent}},
+                            list_lines=[b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren) "/" "Sent Items"'])
+        self._poll(adapter, imap)
+        imap.select.assert_any_call('"Sent Items"', readonly=True)
+        self.assertEqual(adapter._store.root_for([answer_copy]), key)
+
+    def test_sent_folder_setting(self):
+        for tag, (setting, expected) in enumerate((("Archive/Out", "Archive/Out"), (False, None), ("off", None))):
+            with self.subTest(setting=setting):
+                adapter = make_adapter(sent_folder=setting)
+                key, _, answer_copy, sent = self._thread(adapter, str(tag))
+                imap = fake_folders({"INBOX": {}, "Sent": {"messages": sent}, "Archive/Out": {"messages": sent}})
+                self._poll(adapter, imap)
+                if expected is None:
+                    imap.list.assert_not_called()
+                    self.assertEqual(imap.selected, ["INBOX"])
+                else:
+                    self.assertIn(expected, imap.selected)
+                    self.assertEqual(adapter._store.root_for([answer_copy]), key)
+
+    def test_no_sent_folder_is_quiet_and_not_retried(self):
+        adapter = make_adapter()
+        self._thread(adapter)
+        imap = fake_folders({"INBOX": {}}, list_lines=[b'(\\HasNoChildren) "/" "INBOX"'])
+        self._poll(adapter, imap)
+        self._poll(adapter, imap)
+        self.assertEqual(imap.list.call_count, 1)
+        self.assertFalse(adapter._last_fetch_failed)
+
+    def test_sent_folder_failure_never_blocks_inbox(self):
+        adapter = make_adapter()
+        self._thread(adapter)
+        mail = make_inbound(subject="Hello", message_id="<h1@test.com>")
+        imap = fake_folders({"INBOX": {"messages": {b"3": mail}}, "Sent": {"messages": {}}}, inbox_unseen=b"3")
+        imap.list.side_effect = OSError("boom")
+        events = self._poll(adapter, imap)
+        self.assertEqual(len(events), 1)
+        self.assertFalse(adapter._last_fetch_failed)
+        self.assertEqual(imap.selected[-1], "INBOX")
+
+
+def build_key(source):
+    from gateway.session import build_session_key
+
+    return build_session_key(source)
+
+
 if __name__ == "__main__":
     unittest.main()
