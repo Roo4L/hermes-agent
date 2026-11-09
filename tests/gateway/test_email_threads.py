@@ -12,7 +12,7 @@ import os
 import unittest
 from email.mime.text import MIMEText
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 ENV = {
@@ -705,6 +705,147 @@ class TestInboundThreads(DispatchCase):
         self.assertEqual(adapter._store._index, index_before)
         self.assertEqual(_store_path().read_text(encoding="utf-8"), file_before)
         self.assertEqual(adapter._root_context, {})
+
+
+class TestColdStart(DispatchCase):
+    """MAIL-05: mail that arrived while the gateway was down is handled after a restart.
+
+    A restart is a new adapter instance with the class-level seen-UID snapshot cleared and the same
+    HERMES_HOME, so the only thing it carries over is the thread store on disk.
+    """
+
+    ADDRESS = "hermes@test.com"
+
+    def _connect(self, adapter, imap, *, is_reconnect=False):
+        # The poll loop is stubbed: each test drives _check_inbox itself, so connect alone never consumes mail.
+        with patch.object(adapter, "_connect_imap", return_value=imap), patch.object(
+            adapter, "_connect_smtp", return_value=MagicMock()
+        ), patch.object(adapter, "_poll_loop", new=AsyncMock()):
+            self.assertTrue(asyncio.run(adapter.connect(is_reconnect=is_reconnect)))
+        asyncio.run(adapter.disconnect())
+
+    def _poll(self, adapter, imap):
+        events = self.capture(adapter)
+        with patch.object(adapter, "_connect_imap", return_value=imap):
+            asyncio.run(adapter._check_inbox())
+        return events
+
+    @staticmethod
+    def _restart():
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        EmailAdapter._seen_uids_snapshot.clear()
+        return make_adapter()
+
+    def _seed(self, uidvalidity, uid_mark):
+        from plugins.platforms.email.adapter import _EmailThreadStore
+
+        _EmailThreadStore(_store_path()).set_uid_state(self.ADDRESS, uidvalidity, uid_mark)
+
+    def _state(self):
+        """The UID state as a fresh process would read it from disk."""
+        from plugins.platforms.email.adapter import _EmailThreadStore
+
+        return _EmailThreadStore(_store_path()).uid_state(self.ADDRESS)
+
+    @staticmethod
+    def _mail(n, sender="User <user@test.com>"):
+        return make_inbound(sender=sender, subject=f"Mail {n}", body=f"body {n}", message_id=f"<m{n}@test.com>")
+
+    @staticmethod
+    def _bodies(events):
+        return [event.text.rsplit("\n", 1)[-1] for event in events]
+
+    def test_no_mark_marks_all_seen(self):
+        adapter = make_adapter()
+        self._connect(adapter, fake_imap(uids_all=b"1 2 3"))
+        self.assertEqual(adapter._seen_uids, {b"1", b"2", b"3"})
+        self.assertEqual(self._state(), ("42", 3))
+
+    def test_empty_mailbox_sets_zero_mark(self):
+        self._connect(make_adapter(), fake_imap(uids_all=b""))
+        self.assertEqual(self._state(), ("42", 0))
+        # The first mail arrives while the gateway is down: the next start still handles it.
+        adapter = self._restart()
+        imap = fake_imap(uids_all=b"1", uids_unseen=b"1", messages={b"1": self._mail(1)})
+        self._connect(adapter, imap)
+        self.assertEqual(adapter._seen_uids, set())
+        self.assertEqual(self._bodies(self._poll(adapter, imap)), ["body 1"])
+        self.assertEqual(self._state(), ("42", 1))
+
+    def test_mail_after_mark_dispatched_after_restart(self):
+        first = make_adapter()
+        self._connect(first, fake_imap(uids_all=b"1 2 3"))
+        self.assertEqual(self._state(), ("42", 3))
+        # Gateway down; mail 4 and 5 arrive. A new process starts with the same HERMES_HOME.
+        second = self._restart()
+        imap = fake_imap(uids_all=b"1 2 3 4 5", uids_unseen=b"4 5",
+                         messages={b"4": self._mail(4), b"5": self._mail(5)})
+        self._connect(second, imap)
+        self.assertEqual(second._seen_uids, {b"1", b"2", b"3"})
+        events = self._poll(second, imap)
+        self.assertEqual(self._bodies(events), ["body 4", "body 5"])
+        self.assertEqual(self._state(), ("42", 5))
+
+    def test_uidvalidity_change_resets_mark(self):
+        self._seed("42", 3)
+        adapter = self._restart()
+        self._connect(adapter, fake_imap(uids_all=b"1 2 3 4 5", uidvalidity=b"99"))
+        self.assertEqual(adapter._seen_uids, {b"1", b"2", b"3", b"4", b"5"})
+        self.assertEqual(self._state(), ("99", 5))
+
+    def test_missing_uidvalidity_means_no_mark(self):
+        self._seed("42", 3)
+        adapter = self._restart()
+        self._connect(adapter, fake_imap(uids_all=b"1 2 3 4 5", uidvalidity=None))
+        self.assertEqual(adapter._seen_uids, {b"1", b"2", b"3", b"4", b"5"})
+        self.assertEqual(self._state(), ("42", 3))
+
+    def test_mark_advances_after_dispatch(self):
+        self._seed("42", 3)
+        adapter = self._restart()
+        imap = fake_imap(uids_all=b"1 2 3 4 5", uids_unseen=b"4 5",
+                         messages={b"4": self._mail(4), b"5": self._mail(5)})
+        self._connect(adapter, imap)
+        marks_seen_by_handler = []
+
+        async def _record(event):
+            marks_seen_by_handler.append((event.text.rsplit("\n", 1)[-1], self._state()[1]))
+
+        adapter.handle_message = _record
+        with patch.object(adapter, "_connect_imap", return_value=imap):
+            asyncio.run(adapter._check_inbox())
+        # Mail 5 is handled after mail 4's dispatch moved the mark, not only at the end of the batch.
+        self.assertEqual(marks_seen_by_handler, [("body 4", 3), ("body 5", 4)])
+        self.assertEqual(self._state(), ("42", 5))
+
+    def test_filtered_uid_still_advances_mark(self):
+        self._seed("42", 3)
+        adapter = self._restart()
+        robot = "Robot <noreply@test.com>"
+        messages = {b"4": self._mail(4, sender=robot), b"5": self._mail(5), b"6": self._mail(6, sender=robot)}
+        imap = fake_imap(uids_all=b"1 2 3 4 5 6", uids_unseen=b"4 5 6", messages=messages)
+        self._connect(adapter, imap)
+        self.assertEqual(self._bodies(self._poll(adapter, imap)), ["body 5"])
+        # 6 was dropped by the automated-sender filter and is the batch's last UID: the mark still covers it.
+        self.assertEqual(self._state(), ("42", 6))
+        later = self._restart()
+        self._connect(later, imap)
+        self.assertEqual(later._seen_uids, {b"1", b"2", b"3", b"4", b"5", b"6"})
+        self.assertEqual(self._poll(later, imap), [])
+
+    def test_reconnect_snapshot_path_unchanged(self):
+        first = make_adapter()
+        self._connect(first, fake_imap(uids_all=b"1 2 3"))
+        file_before = _store_path().read_bytes()
+        # Same-process reconnect: the snapshot wins, even against a UIDVALIDITY that would reset the mark.
+        second = make_adapter()
+        imap = fake_imap(uids_all=b"1 2 3 4", uidvalidity=b"99")
+        self._connect(second, imap, is_reconnect=True)
+        self.assertEqual(second._seen_uids, {b"1", b"2", b"3"})
+        imap.response.assert_not_called()
+        self.assertEqual(_store_path().read_bytes(), file_before)
+        self.assertEqual(self._state(), ("42", 3))
 
 
 if __name__ == "__main__":

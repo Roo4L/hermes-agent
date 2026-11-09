@@ -139,6 +139,28 @@ def _bare_id(message_id: Optional[str]) -> str:
     return (message_id or "").strip().strip("<>").strip()
 
 
+def _uid_int(uid: Any) -> int:
+    """An IMAP UID (bytes or str) as an int; ``-1`` for anything unparseable, so a bad UID counts as old mail."""
+    try:
+        return int(uid.decode("ascii") if isinstance(uid, (bytes, bytearray)) else uid)
+    except (ValueError, TypeError, AttributeError, UnicodeDecodeError):
+        return -1
+
+
+def _uidvalidity(imap: Any) -> Optional[str]:
+    """The selected mailbox's UIDVALIDITY as a string, or ``None`` when the server sent none (or anything odd)."""
+    try:
+        _, items = imap.response("UIDVALIDITY")
+        for item in items or ():
+            if isinstance(item, (bytes, bytearray)):
+                item = bytes(item).decode("ascii")
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+    except Exception:
+        pass
+    return None
+
+
 _REPLY_PREFIX_RE = re.compile(r"^(?:\s*(?:re|fwd|fw)\s*:)+\s*", re.IGNORECASE)
 
 
@@ -297,9 +319,12 @@ class _EmailThreadStore:
             self._save()
 
     def advance_uid_mark(self, address: str, uid: int) -> None:
-        """Raise the mailbox's UID mark to *uid* (never lowers it)."""
+        """Raise the mailbox's UID mark to *uid* (never lowers it). A no-op while no UIDVALIDITY is stored for the
+        address: a mark without one is never trusted, so none is written."""
         with self._lock:
-            state = self._mailboxes.setdefault((address or "").lower(), {"uidvalidity": None, "uid_mark": None})
+            state = self._mailboxes.get((address or "").lower())
+            if not state or state.get("uidvalidity") is None or uid < 0:
+                return
             if state.get("uid_mark") is not None and state["uid_mark"] >= uid:
                 return
             state["uid_mark"] = int(uid)
@@ -616,6 +641,7 @@ class EmailAdapter(BasePlatformAdapter):
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
         self._poll_task: Optional[asyncio.Task] = None
         self._last_fetch_failed, self._last_fetch_error = False, ""  # "checked, nothing new" vs "the check itself failed"
+        self._fetched_max_uid = 0  # highest UID the last _fetch_new_messages fetched OK (the cold-start mark follows it)
         # chat_id (sender email) -> last subject + message-id for threading
         # Track the last IMAP fetch attempt so the poll loop can distinguish "checked, nothing new" from
         # "the check itself failed" (#80016).
@@ -697,10 +723,22 @@ class EmailAdapter(BasePlatformAdapter):
                     # arrived during the outage stays eligible for the next poll.
                     self._seen_uids = set(snapshot)
                     passed = "[Email] IMAP reconnect test passed. Restored %d seen UIDs; messages received during the outage will be processed."
-                else:  # first connect (or no snapshot): mark all existing messages seen
+                else:  # first connect (or no snapshot): mark existing messages seen, up to the stored UID mark
                     status, data = imap.uid("search", None, "ALL")
-                    self._seen_uids.update(data[0].split() if status == "OK" and data and data[0] else ())
-                    passed = "[Email] IMAP connection test passed. %d existing messages skipped."
+                    all_uids = data[0].split() if status == "OK" and data and data[0] else []
+                    # UIDs above a mark stored under the same UIDVALIDITY arrived while the gateway was down and
+                    # stay eligible for the UNSEEN poll. Classified here by int(uid): ``UID SEARCH UID n:*`` always
+                    # includes the last message. No mark, or a missing or changed UIDVALIDITY: mark everything seen.
+                    validity = _uidvalidity(imap)
+                    stored_validity, mark = self._store.uid_state(self._address)
+                    if validity is None or stored_validity != validity:
+                        mark = None
+                    self._seen_uids.update(u for u in all_uids if mark is None or _uid_int(u) <= mark)
+                    if validity is not None and mark is None:
+                        self._store.set_uid_state(self._address, validity, max((_uid_int(u) for u in all_uids), default=0))
+                    caught_up = 0 if mark is None else sum(1 for u in all_uids if _uid_int(u) > mark)
+                    passed = ("[Email] IMAP connection test passed. %d existing messages skipped; "
+                              f"{caught_up} newer than the stored mark stay eligible.")
                 self._trim_seen_uids()
                 logger.info(passed, len(self._seen_uids))
             self._seen_uids_snapshot[self._address] = set(self._seen_uids)
@@ -771,6 +809,9 @@ class EmailAdapter(BasePlatformAdapter):
         # Dispatch partial results BEFORE escalating a failure — a mid-batch exception returns what was fetched (already marked seen).
         for msg_data in messages:
             await self._dispatch_message(msg_data)
+            self._store.advance_uid_mark(self._address, _uid_int(msg_data.get("uid")))
+        # UIDs the filters dropped (automated senders, unparseable mail) move the mark too, or they replay after a restart.
+        self._store.advance_uid_mark(self._address, self._fetched_max_uid)
         if self._last_fetch_failed:
             # The IMAP check itself failed (not an empty inbox): route through the fatal-error hook so the gateway's
             # reconnect/backoff re-establishes the mailbox. The handler runs detached (gateway/run.py), so awaiting it is safe.
@@ -783,6 +824,7 @@ class EmailAdapter(BasePlatformAdapter):
     def _fetch_new_messages(self) -> List[Dict[str, Any]]:
         """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
         results = []
+        self._fetched_max_uid = 0  # highest UID fetched OK this call; _check_inbox moves the stored mark past it
         try:
             with self._inbox() as imap:
                 status, data = imap.uid("search", None, "UNSEEN")
@@ -792,6 +834,7 @@ class EmailAdapter(BasePlatformAdapter):
                     status, msg_data = imap.uid("fetch", uid, "(RFC822)")
                     if status != "OK":
                         continue  # transient per-UID refusal: leave unseen so the next poll retries
+                    self._fetched_max_uid = max(self._fetched_max_uid, _uid_int(uid))
                     # Mark seen once a response arrived (even malformed) so garbage is skipped once, not retried forever —
                     # but NOT before the fetch: a connection failure must leave the rest of the batch eligible for the next poll.
                     # IMAP fetch can return unexpected structures (e.g. a single bytes item instead of a
