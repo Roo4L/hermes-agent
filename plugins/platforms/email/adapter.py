@@ -235,8 +235,8 @@ def _uidvalidity(imap: Any) -> Optional[str]:
                 item = bytes(item).decode("ascii")
             if isinstance(item, str) and item.strip():
                 return item.strip()
-    except Exception:
-        pass
+    except (ValueError, TypeError) as exc:  # an odd response shape, or a non-ASCII value
+        logger.debug("[Email] Ignoring an unreadable UIDVALIDITY response: %s", exc)
     return None
 
 
@@ -1150,8 +1150,10 @@ class EmailAdapter(BasePlatformAdapter):
             self._sent_mark = (validity, max([mark or 0, *(_uid_int(u) for u in uids)]))
             if learned:
                 logger.info("[Email] Indexed %d delivered Message-ID(s) of sent mail from %s", learned, self._sent_folder)
-        except Exception as exc:
+        except (imaplib.IMAP4.error, OSError, ValueError) as exc:  # IMAP refusal or abort, socket/TLS, bad bytes
             logger.warning("[Email] Could not read the Sent folder for delivered Message-IDs: %s", exc)
+        except Exception as exc:  # deliberate boundary: a Sent-read bug must never block the INBOX poll after it
+            logger.warning("[Email] Could not read the Sent folder for delivered Message-IDs: %s", exc, exc_info=True)
         return selected
 
     def _message_metadata(self, uid: bytes, msg: email_lib.message.Message) -> Optional[dict[str, Any]]:
@@ -1325,7 +1327,7 @@ class EmailAdapter(BasePlatformAdapter):
             key = _root_key(header)
             self._store.add_pending_root(key, header, name, (parent_chat_id or "").strip().lower())
             return key
-        except Exception as exc:
+        except (TypeError, ValueError) as exc:  # the root did not serialize; a failed file write is the store's warning
             logger.warning("[Email] Handoff thread: could not record a thread root for %s: %s", parent_chat_id, exc)
             return None
 
@@ -1399,8 +1401,9 @@ class EmailAdapter(BasePlatformAdapter):
                 self._store.mark_sent(thread_key, subject, job_id)
             self._store.index_message(msg_id, thread_key)
             return was_root
-        except Exception as exc:
-            logger.warning("[Email] Could not record sent mail %s in thread %s: %s", msg_id, thread_key, exc)
+        except Exception as exc:  # deliberate boundary: the mail is out, so a store error must not report it failed
+            logger.warning("[Email] Could not record sent mail %s in thread %s: %s", msg_id, thread_key, exc,
+                           exc_info=True)
             return False
 
     def _send_email(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None,

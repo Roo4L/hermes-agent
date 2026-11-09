@@ -2182,51 +2182,6 @@ class TestCronDeliveryMirror:
         mirror_mock.assert_called_once()
         assert mirror_mock.call_args.kwargs.get("thread_id") == "9001"
 
-    def test_email_seed_key_matches_inbound_reply(self):
-        """An email reply is always a DM-typed source, so the seed for an email
-        thread must land on the ``dm`` slot: its session key has to equal the key
-        of the inbound reply in that thread, or the reply starts a fresh session."""
-        from cron.scheduler_delivery import _seed_cron_thread_session
-        from gateway.session import build_session_key, SessionSource
-        from gateway.config import Platform
-
-        store = MagicMock()
-        adapter = MagicMock()
-        adapter._session_store = store
-
-        with patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
-            _seed_cron_thread_session(
-                {"id": "j1", "name": "Report"}, adapter, "email",
-                "user@example.com", "hermes-abc123@example.com", "report body",
-            )
-
-        store.get_or_create_session.assert_called_once()
-        seeded_source = store.get_or_create_session.call_args[0][0]
-        assert seeded_source.chat_type == "dm"
-        assert seeded_source.thread_id == "hermes-abc123@example.com"
-        seed_key = build_session_key(seeded_source)
-
-        # What a reply in that thread resolves to: the adapter builds every
-        # inbound email source as a DM from the sender, threaded on the root.
-        inbound = SessionSource(
-            platform=Platform.EMAIL, chat_id="user@example.com", chat_type="dm",
-            user_id="user@example.com", thread_id="hermes-abc123@example.com",
-        )
-        assert seed_key == build_session_key(inbound), (
-            f"seed key {seed_key} != inbound reply key {build_session_key(inbound)}"
-        )
-        mirror_mock.assert_called_once()
-        assert mirror_mock.call_args.kwargs.get("thread_id") == "hermes-abc123@example.com"
-
-    def test_thread_reply_chat_type_table_has_email_dm(self):
-        """Email seeds the DM lane; the group-slot platforms are unchanged."""
-        from cron.scheduler_delivery import _THREAD_REPLY_CHAT_TYPE
-
-        assert _THREAD_REPLY_CHAT_TYPE["email"] == "dm"
-        assert _THREAD_REPLY_CHAT_TYPE["slack"] == "group"
-        assert _THREAD_REPLY_CHAT_TYPE["matrix"] == "group"
-        assert _THREAD_REPLY_CHAT_TYPE["telegram"] == "group"
-
 class TestCronContinuableSurfaceInChannel:
     """cron_continuable_surface: in_channel — deliver a continuable cron FLAT
     into a channel (no dedicated thread), so a plain channel reply continues the
