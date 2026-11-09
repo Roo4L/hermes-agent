@@ -66,8 +66,9 @@ def fake_imap(uids_all=b"", uids_unseen=b"", messages=None, uidvalidity=b"42"):
     """A MagicMock IMAP4_SSL connection.
 
     ``uid("search", None, "ALL")`` returns *uids_all*, ``uid("search", None,
-    "UNSEEN")`` returns *uids_unseen*, and ``uid("fetch", uid, ...)`` returns the
-    raw bytes in *messages* (keys are bytes like ``b"4"``). Anything else is NO.
+    "UNSEEN")`` returns *uids_unseen*, ``uid("fetch", uid, ...)`` returns the
+    raw bytes in *messages* (keys are bytes like ``b"4"``) and ``uid("store", ...)``
+    is OK. Anything else is NO.
     ``response("UIDVALIDITY")`` gives *uidvalidity* (``[None]`` when it is None).
     """
     messages = dict(messages or {})
@@ -86,6 +87,8 @@ def fake_imap(uids_all=b"", uids_unseen=b"", messages=None, uidvalidity=b"42"):
             uid = _as_bytes(args[0])
             if uid in messages:
                 return ("OK", [(uid, messages[uid])])
+        if command == "store":
+            return ("OK", [])
         return ("NO", [])
 
     imap.uid.side_effect = uid_handler
@@ -238,7 +241,7 @@ class TestHtmlPart(unittest.TestCase):
         msg = self._send(make_adapter(html=True), body)
         types = [p.get_content_type() for p in msg.walk()]
         self.assertEqual(types, ["multipart/mixed", "multipart/alternative", "text/plain", "text/html"])
-        plain = [p for p in msg.walk() if p.get_content_type() == "text/plain"][0]
+        plain = next(p for p in msg.walk() if p.get_content_type() == "text/plain")
         self.assertEqual(plain.get_payload(decode=True).decode("utf-8"), body)
         html = _html_of(msg)
         self.assertIn("<h1>Title</h1>", html)
@@ -436,7 +439,7 @@ class TestOutboundThreads(unittest.TestCase):
 
     @staticmethod
     def _plain(msg):
-        return [p for p in msg.walk() if p.get_content_type() == "text/plain"][0].get_payload(decode=True).decode("utf-8")
+        return next(p for p in msg.walk() if p.get_content_type() == "text/plain").get_payload(decode=True).decode("utf-8")
 
     def test_create_handoff_thread_mints_pending_root(self):
         import re
@@ -1104,7 +1107,7 @@ class TestDeliveredMessageIds(DispatchCase):
     def test_send_record_beats_sent_folder(self):
         # An id the adapter itself indexed when sending (a provider that keeps Message-IDs) is not re-pointed.
         adapter = make_adapter()
-        key, _, _, sent = self._thread(adapter)
+        _, _, _, sent = self._thread(adapter)
         other = asyncio.run(adapter.create_handoff_thread("user@test.com", "Hermes — Other"))
         self._send(adapter, "Subject: Other\n\nx", metadata={"thread_id": other})
         other_reply, _ = self._send(adapter, "more", metadata={"thread_id": other})
