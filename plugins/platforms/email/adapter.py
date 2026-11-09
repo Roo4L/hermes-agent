@@ -1047,15 +1047,16 @@ class EmailAdapter(BasePlatformAdapter):
                    attach_empty_body: bool = False, thread_key: Optional[str] = None) -> Tuple[MIMEMultipart, str, str]:
         """Build a reply skeleton. Returns ``(msg, msg_id, subject)``.
 
-        A pending thread root goes out fresh (Message-ID = the root, no In-Reply-To/References, subject from a
-        leading ``Subject:`` line else the job name); any other *thread_key* replies inside that thread with the
-        References chain from the root; no *thread_key* threads on the sender's last mail, as before."""
+        A pending thread root goes out fresh (Message-ID = the root, References = the root so a reply carries it
+        even if a provider replaces the Message-ID, no In-Reply-To; subject from a leading ``Subject:`` line else the
+        job name); any other *thread_key* replies inside that thread with the References chain from the root; no
+        *thread_key* threads on the sender's last mail, as before."""
         msg = MIMEMultipart()
         root = self._store.get_root(thread_key) if thread_key else None
         if root and root.get("pending"):
             subject, body = _split_subject(body, _subject_from_thread_name(root.get("name")))
             msg_id = root.get("header") or f"<{thread_key}>"
-            thread_headers: tuple = ()
+            thread_headers: tuple = (("References", msg_id),)
         else:
             msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
             if thread_key:

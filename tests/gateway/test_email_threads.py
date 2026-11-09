@@ -459,7 +459,7 @@ class TestOutboundThreads(unittest.TestCase):
         self.assertEqual(msg["Message-ID"], "<" + key + ">")
         self.assertEqual(msg["Subject"], "Report — Nov 9")
         self.assertIsNone(msg["In-Reply-To"])
-        self.assertIsNone(msg["References"])
+        self.assertEqual(msg["References"], "<" + key + ">")
         self.assertNotIn("Subject:", self._plain(msg))
         self.assertEqual(self._plain(msg), "- item")
         self.assertEqual(result.message_id, "<" + key + ">")
@@ -481,9 +481,20 @@ class TestOutboundThreads(unittest.TestCase):
         key = self._mint(adapter)
         _, msg = self._send(adapter, "- item", metadata={"thread_id": key, "job_id": "j1"})
         self.assertIsNone(msg["In-Reply-To"])
-        self.assertIsNone(msg["References"])
+        self.assertEqual(msg["References"], "<" + key + ">")
+        self.assertNotIn("old@test.com", msg["References"])
         self.assertNotIn("Old", msg["Subject"])
         self.assertEqual(msg["Subject"], "Report")
+
+    def test_pending_root_references_its_own_minted_id(self):
+        # Some providers replace the Message-ID of submitted mail; References survives, so the root names itself there.
+        adapter = make_adapter()
+        key = self._mint(adapter)
+        _, msg = self._send(adapter, "Subject: Report\n\n- item", metadata={"thread_id": key, "job_id": "j1"})
+        self.assertEqual(msg["References"], "<" + key + ">")
+        self.assertEqual(msg["Message-ID"], "<" + key + ">")
+        self.assertIsNone(msg["In-Reply-To"])
+        self.assertEqual(len(msg.get_all("References")), 1)
 
     def test_second_chunk_threads_under_root(self):
         adapter = make_adapter()
@@ -556,6 +567,7 @@ class TestInboundThreads(DispatchCase):
     """The inbound half of MAIL-03 and MAIL-04: replies resolve to their thread's root and session key."""
 
     FOREIGN_REFS = "<foreign-root@mail.example.com> <foreign-2@mail.example.com>"
+    REWRITTEN = "<0100018f0a1b2c3d-example@email.example.com>"
 
     def _mint_and_send(self, adapter, content="Subject: Report\n\n- item"):
         key = asyncio.run(adapter.create_handoff_thread("user@test.com", "Hermes — Report"))
@@ -587,6 +599,34 @@ class TestInboundThreads(DispatchCase):
         self.assertEqual(event.source.thread_id, key)
         self.assertEqual(event.source.chat_id, "user@test.com")
         self.assertEqual(event.source.chat_type, "dm")
+
+    def test_reply_to_rewritten_root_id_routes_by_minted_reference(self):
+        # The provider delivered the root under REWRITTEN; the reader's client replies to that id and copies the
+        # root's References before it, as mail clients do.
+        for n, extra in enumerate(({}, {"thread_sessions": True})):
+            with self.subTest(extra=extra):
+                adapter = make_adapter(**extra)
+                key = asyncio.run(adapter.create_handoff_thread("user@test.com", "Hermes — Report"))
+                _, root_msg = self._send(adapter, "Subject: Report\n\n- item",
+                                         metadata={"thread_id": key, "job_id": "j1"})
+                references = " ".join(filter(None, [root_msg["References"], self.REWRITTEN]))
+                self.assertEqual(references, f"<{key}> {self.REWRITTEN}")
+                event = self._dispatch(adapter, subject="Re: Report", in_reply_to=self.REWRITTEN,
+                                       references=references, message_id=f"<r{n}-1@test.com>")
+                self.assertEqual(event.source.thread_id, key)
+                direct = self._dispatch(adapter, subject="Re: Report", in_reply_to=f"<{key}>",
+                                        references=f"<{key}>", message_id=f"<r{n}-2@test.com>")
+                self.assertEqual(self._key(event.source), self._key(direct.source))
+
+    def test_reply_without_minted_reference_gets_own_root(self):
+        from plugins.platforms.email.adapter import _root_key
+
+        adapter = make_adapter(thread_sessions=True)
+        key = self._mint_and_send(adapter)
+        event = self._dispatch(adapter, subject="Re: Report", in_reply_to=self.REWRITTEN, references=self.REWRITTEN,
+                               message_id="<r1@test.com>")
+        self.assertNotEqual(event.source.thread_id, key)
+        self.assertEqual(event.source.thread_id, _root_key(self.REWRITTEN))
 
     def test_reply_to_hermes_reply_resolves_via_index(self):
         adapter = make_adapter()
