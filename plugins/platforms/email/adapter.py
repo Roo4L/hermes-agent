@@ -56,7 +56,55 @@ _HTML_SUBS = ((re.compile(r"<br\s*/?>", re.IGNORECASE), "\n"), (re.compile(r"<p[
 # "method=result" tokens (``dmarc=pass``) and property values (``header.from=x``) in Authentication-Results.
 _AUTH_METHOD_RE = re.compile(r"\b(dmarc|dkim|spf)\s*=\s*([a-z]+)", re.IGNORECASE)
 _AUTH_PROP_RE = re.compile(r"\b(header\.from|header\.d|smtp\.mailfrom|smtp\.from|envelope-from)\s*=\s*([^\s;]+)", re.IGNORECASE)
+# A leading "Subject: ..." line (optionally after a "[CRON_FAILURE]" marker line) names the mail and leaves the body.
+_SUBJECT_LINE_RE = re.compile(r"\A(?:\s*\[CRON_FAILURE\][ \t\r]*\n)?\s*Subject:[ \t]*([^\n]*\S)[ \t\r]*(?:\n|\Z)", re.IGNORECASE)
+_MAX_SUBJECT_LEN = 250
+_THREAD_NAME_PREFIX = "Hermes — "  # cron's handoff thread name: "Hermes — <job name>"
+_MD_RENDERER: Any = None  # None = not tried yet, False = markdown-it-py unavailable
 
+
+def _split_subject(content: str, fallback: str) -> Tuple[str, str]:
+    """``(subject, body)``: subject from a leading ``Subject:`` line (stripped from the body), else *fallback*."""
+    m = _SUBJECT_LINE_RE.match(content or "")
+    if not m:
+        return fallback, content
+    subject = re.sub(r"[\r\x00-\x1f\x7f]", "", m.group(1)).strip()[:_MAX_SUBJECT_LEN]
+    return (subject, content[m.end():].lstrip("\n")) if subject else (fallback, content)
+
+
+def _subject_from_thread_name(name: Optional[str]) -> str:
+    """Job name from cron's ``"Hermes — <job name>"`` thread name; ``"Hermes Agent"`` when unknown."""
+    name = (name or "").strip()
+    if name.startswith(_THREAD_NAME_PREFIX):
+        name = name[len(_THREAD_NAME_PREFIX):].strip()
+    return name[:_MAX_SUBJECT_LEN] or "Hermes Agent"
+
+
+def _render_html(text: str) -> Optional[str]:
+    """Markdown -> HTML (raw HTML escaped, images off, ``javascript:`` links refused); ``None`` when markdown-it-py is missing."""
+    global _MD_RENDERER
+    if _MD_RENDERER is None:
+        try:
+            from markdown_it import MarkdownIt
+            _MD_RENDERER = MarkdownIt("js-default", {"html": False}).disable("image")
+        except ImportError:
+            logger.warning("[Email] html is on but markdown-it-py is not installed; sending plain text only")
+            _MD_RENDERER = False
+    if not _MD_RENDERER:
+        return None
+    return f'<html><head><meta charset="utf-8"></head><body>\n{_MD_RENDERER.render(text)}</body></html>'
+
+
+def _attach_body(msg: MIMEMultipart, body: str, html: bool) -> None:
+    """Attach *body* as text/plain, or as multipart/alternative (plain, then rendered HTML) when *html*."""
+    rendered = _render_html(body) if html and body else None
+    if rendered is None:
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        return
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(body, "plain", "utf-8"))
+    alt.attach(MIMEText(rendered, "html", "utf-8"))
+    msg.attach(alt)
 
 def _esecret_int(name: str, default: int) -> int:
     """Scope-aware integer read."""
@@ -354,6 +402,7 @@ class EmailAdapter(BasePlatformAdapter):
         self._smtp_tls_verify = tls_verify("EMAIL_SMTP_TLS_VERIFY", "smtp_tls_verify")
         self._poll_interval = _esecret_int("EMAIL_POLL_INTERVAL", 15)
         self._skip_attachments = extra.get("skip_attachments", False)  # platforms.email.skip_attachments
+        self._html = is_truthy_value(extra.get("html"), default=False)  # platforms.email.html: add a text/html part rendered from Markdown
         # Require an authenticated From: domain (SPF/DKIM/DMARC) before trusting it for authorization
         # (GHSA-rxqh-5572-8m77). Default ON; opt out via require_authenticated_sender: false / EMAIL_TRUST_FROM_HEADER=true.
         if "require_authenticated_sender" in extra:
@@ -709,7 +758,7 @@ class EmailAdapter(BasePlatformAdapter):
                            ("Date", formatdate(localtime=True)), ("Message-ID", msg_id)):
             msg[key] = value
         if body or attach_empty_body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            _attach_body(msg, body, self._html)
         return msg, msg_id, subject
 
     def _smtp_send(self, msg: MIMEMultipart) -> None:
@@ -809,9 +858,16 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
     smtp_tls_verify = _esecret_bool("EMAIL_SMTP_TLS_VERIFY", is_truthy_value(extra.get("smtp_tls_verify"), default=True))
     if not all([address, password, smtp_host]):
         return send_error("Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)")
+    subject, message = _split_subject(message, "Hermes Agent")
     try:
-        msg = MIMEText(message, "plain", "utf-8")
-        for key, value in (("From", address), ("To", chat_id), ("Subject", "Hermes Agent"), ("Date", formatdate(localtime=True))):
+        rendered = _render_html(message) if is_truthy_value(extra.get("html"), default=False) and message else None
+        if rendered is None:
+            msg = MIMEText(message, "plain", "utf-8")
+        else:
+            msg = MIMEMultipart("alternative")
+            msg.attach(MIMEText(message, "plain", "utf-8"))
+            msg.attach(MIMEText(rendered, "html", "utf-8"))
+        for key, value in (("From", address), ("To", chat_id), ("Subject", subject), ("Date", formatdate(localtime=True))):
             msg[key] = value
         server = _open_smtp(smtp_host, smtp_port, smtp_security, _tls_context(smtp_tls_verify, smtp_host), smtplib.SMTP, smtplib.SMTP_SSL)
         server.login(address, password)
@@ -840,6 +896,6 @@ def register(ctx) -> None:
     ctx.register_platform(
         name="email", label="Email", adapter_factory=EmailAdapter, check_fn=check_email_requirements, is_connected=_is_connected,
         required_env=["EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_SMTP_HOST"],
-        install_hint="Email uses the Python stdlib (smtplib/imaplib) — no extra deps", allowed_users_env="EMAIL_ALLOWED_USERS",
+        install_hint="Email uses the Python stdlib (smtplib/imaplib); the optional html part uses markdown-it-py (a core dependency)", allowed_users_env="EMAIL_ALLOWED_USERS",
         allow_all_env="EMAIL_ALLOW_ALL_USERS", cron_deliver_env_var="EMAIL_HOME_ADDRESS", standalone_sender_fn=_standalone_send,
         max_message_length=50_000, pii_safe=True, emoji="📧", allow_update_command=True)

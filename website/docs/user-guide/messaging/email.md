@@ -145,7 +145,7 @@ Replies are sent via SMTP with proper email threading:
 - **In-Reply-To** and **References** headers maintain the thread
 - **Subject line** preserved with `Re:` prefix (no double `Re: Re:`)
 - **Message-ID** generated with the agent's domain
-- Responses are sent as plain text (UTF-8)
+- Responses are sent as plain text (UTF-8), with an optional HTML part (see [HTML Part](#html-part))
 
 ### File Attachments
 
@@ -162,6 +162,18 @@ platforms:
 ```
 
 When enabled, attachment and inline parts are skipped before payload decoding. The email body text is still processed normally.
+
+### HTML Part
+
+To send each reply with an HTML rendering of its Markdown alongside the plain text, add to your `config.yaml`:
+
+```yaml
+platforms:
+  email:
+    html: true
+```
+
+Off by default. When enabled, each outgoing email carries the Markdown as `text/plain` and an HTML rendering (made with markdown-it-py) as `text/html`, so mail clients show headings, lists and tables. Raw HTML in the text is escaped and images render as links, so nothing loads remotely when the mail is opened.
 
 ---
 
