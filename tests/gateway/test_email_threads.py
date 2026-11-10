@@ -862,6 +862,47 @@ class TestColdStart(DispatchCase):
         self.assertEqual(marks_seen_by_handler, [("body 4", 3), ("body 5", 4)])
         self.assertEqual(self._state(), ("42", 5))
 
+    def test_eight_bit_thread_headers_do_not_drop_the_batch(self):
+        """Raw 8-bit bytes in Message-ID / References / In-Reply-To parse to ``Header`` objects (compat32); the
+        mail is still handled, and the next mail in the same poll too."""
+        self._seed("42", 3)
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        EmailAdapter._seen_uids_snapshot.clear()
+        with patch.dict(os.environ, ENV):
+            adapter = EmailAdapter(PlatformConfig(enabled=True, extra={"thread_sessions": True}))
+        eight_bit = (b"From: User <user@test.com>\r\nTo: hermes@test.com\r\nSubject: Mail 4\r\n"
+                     b"Message-ID: <m4\xe9@test.com>\r\nIn-Reply-To: <r\xe9@test.com>\r\n"
+                     b"References: <root@test.com> <r\xe9@test.com>\r\n"
+                     b"Content-Type: text/plain; charset=utf-8\r\n\r\nbody 4\r\n")
+        imap = fake_imap(uids_all=b"1 2 3 4 5", uids_unseen=b"4 5", messages={b"4": eight_bit, b"5": self._mail(5)})
+        self._connect(adapter, imap)
+        events = self._poll(adapter, imap)
+        self.assertEqual(self._bodies(events), ["body 4", "body 5"])
+        self.assertTrue(all(isinstance(e.message_id, str) for e in events))
+        self.assertEqual(self._state(), ("42", 5))
+
+    def test_one_failing_dispatch_does_not_drop_the_batch(self):
+        self._seed("42", 3)
+        adapter = self._restart()
+        imap = fake_imap(uids_all=b"1 2 3 4 5", uids_unseen=b"4 5",
+                         messages={b"4": self._mail(4), b"5": self._mail(5)})
+        self._connect(adapter, imap)
+        real_dispatch, handled = adapter._dispatch_message, []
+
+        async def _dispatch(msg_data):
+            if msg_data["uid"] == b"4":
+                raise TypeError("poison")
+            handled.append(msg_data["uid"])
+            await real_dispatch(msg_data)
+
+        with patch.object(adapter, "_dispatch_message", side_effect=_dispatch), \
+                self.assertLogs("plugins.platforms.email.adapter", level="ERROR"):
+            events = self._poll(adapter, imap)
+        self.assertEqual((handled, self._bodies(events)), ([b"5"], ["body 5"]))
+        self.assertEqual(self._state(), ("42", 5))
+
     def test_filtered_uid_still_advances_mark(self):
         self._seed("42", 3)
         adapter = self._restart()

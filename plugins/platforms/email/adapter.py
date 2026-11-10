@@ -1034,7 +1034,10 @@ class EmailAdapter(BasePlatformAdapter):
         messages = await asyncio.to_thread(self._fetch_new_messages, gate)
         # Dispatch partial results BEFORE escalating a failure — a mid-batch exception returns what was fetched (already marked seen).
         for msg_data in messages:
-            await self._dispatch_message(msg_data)
+            try:
+                await self._dispatch_message(msg_data)
+            except Exception:  # one bad mail must not drop the rest of the batch: all of it is already \Seen
+                logger.exception("[Email] Dispatch failed for UID %s, skipping", msg_data.get("uid"))
             self._store.advance_uid_mark(self._address, _uid_int(msg_data.get("uid")))
         # UIDs the filters dropped (automated senders, unparseable mail) move the mark too, or they replay after a restart.
         self._store.advance_uid_mark(self._address, self._fetched_max_uid)
@@ -1170,8 +1173,9 @@ class EmailAdapter(BasePlatformAdapter):
             return None
         sender_authenticated, auth_reason = _verify_sender_authentication(msg, sender_addr, authserv_id=self._authserv_id)
         return {"uid": uid, "sender_addr": sender_addr, "sender_name": sender_name, "subject": subject,
-                "message_id": msg.get("Message-ID", ""), "in_reply_to": msg.get("In-Reply-To", ""),
-                "references": msg.get("References", "") or "",
+                # str(): a header with raw 8-bit bytes parses to an email.header.Header, not a str (compat32)
+                "message_id": str(msg.get("Message-ID") or ""), "in_reply_to": str(msg.get("In-Reply-To") or ""),
+                "references": str(msg.get("References") or ""),
                 "date": msg.get("Date", ""), "sender_authenticated": sender_authenticated, "auth_reason": auth_reason}
 
     def _parse_fetched_headers(self, uid: bytes, raw_headers: bytes | bytearray) -> Optional[dict[str, Any]]:
