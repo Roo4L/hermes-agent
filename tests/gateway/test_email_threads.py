@@ -335,7 +335,8 @@ class TestThreadStore(unittest.TestCase):
 
         self.assertEqual(_root_key("<hermes-abc@test.com>"), "hermes-abc@test.com")
         self.assertEqual(_root_key("  hermes-abc@test.com "), "hermes-abc@test.com")
-        hashed = ["<a/../b@x.com>", "<a b@x.com>", "<" + "x" * 200 + "@x.com>", "<\\evil@x.com>", "<c:x@y>"]
+        hashed = ["<a/../b@x.com>", "<a b@x.com>", "<" + "x" * 200 + "@x.com>", "<\\evil@x.com>", "<c:x@y>",
+                  "<x@[IPv6:::1]>"]
         for raw in hashed:
             key = _root_key(raw)
             self.assertTrue(key.startswith("h-"), raw)
@@ -565,6 +566,39 @@ class TestOutboundThreads(unittest.TestCase):
         self.assertEqual(root["job_id"], "")
         self.assertIsNone(adapter._store.root_for(["<unrelated@test.com>"]))
 
+    def test_attachments_thread_under_root(self):
+        """A document, an image batch or an image link sent in a thread replies inside it, as text does, and is
+        indexed to the root; it never threads on the sender's latest mail from another conversation."""
+        import tempfile
+
+        adapter = make_adapter()
+        key = self._mint(adapter)
+        self._send(adapter, "Subject: Report — Nov 9\n\n- item", metadata={"thread_id": key, "job_id": "j1"})
+        adapter._thread_context["user@test.com"] = {"subject": "Other question", "message_id": "<other@test.com>"}
+        meta = {"thread_id": key}
+        with tempfile.TemporaryDirectory() as tmp:
+            document, image = Path(tmp) / "report.txt", Path(tmp) / "chart.png"
+            document.write_text("figures", encoding="utf-8")
+            image.write_bytes(b"\x89PNG\r\n\x1a\n")
+            calls = {
+                "send_document": lambda: adapter.send_document("user@test.com", str(document), caption="The file",
+                                                               metadata=meta),
+                "send_multiple_images": lambda: adapter.send_multiple_images(
+                    "user@test.com", [(f"file://{image}", "Chart")], metadata=meta),
+                "send_image": lambda: adapter.send_image("user@test.com", "https://example.com/c.png",
+                                                         caption="Chart", metadata=meta),
+            }
+            for method, call in calls.items():
+                with self.subTest(method=method), patch("smtplib.SMTP") as mock_smtp:
+                    result = asyncio.run(call())
+                    msg = sent_message(mock_smtp)
+                    self.assertTrue(result.success)
+                    self.assertEqual(msg["Subject"], "Re: Report — Nov 9")
+                    self.assertEqual(msg["In-Reply-To"], f"<{key}>")
+                    self.assertEqual(msg["References"].split()[0], f"<{key}>")
+                    self.assertNotIn("<other@test.com>", msg["References"])
+                    self.assertEqual(adapter._store.root_for([msg["Message-ID"]]), key)
+
 
 class TestInboundThreads(DispatchCase):
     """The inbound half of MAIL-03 and MAIL-04: replies resolve to their thread's root and session key."""
@@ -711,6 +745,14 @@ class TestInboundThreads(DispatchCase):
         self.assertNotEqual(self._key(other.source), self._key(own.source))
         self.assertIn(":dm:other@test.com:", self._key(other.source))
 
+    def test_long_root_id_capped_in_topic(self):
+        adapter = make_adapter(thread_sessions=True)
+        long_id = "<" + "x" * 900 + "@test.com>"
+        event = self._dispatch(adapter, subject="Re: Report", references=long_id, message_id="<l1@test.com>")
+        self.assertTrue(event.source.thread_id.startswith("h-"))
+        self.assertLess(len(event.source.chat_topic), 260)
+        self.assertTrue(event.source.chat_topic.startswith("Report (thread <xxx"))
+
     def test_crafted_message_id_cannot_escape_session_key(self):
         from gateway.session import _is_path_unsafe
 
@@ -748,6 +790,54 @@ class TestInboundThreads(DispatchCase):
         self.assertEqual(adapter._store._index, index_before)
         self.assertEqual(_store_path().read_text(encoding="utf-8"), file_before)
         self.assertEqual(adapter._root_context, {})
+
+    def test_answered_stranger_never_touches_store(self):
+        """With pair or decline the gateway still gets a stranger's mail so it can answer, but the mail is not
+        threaded: no root, no index entry, no thread context. A granted sender still threads."""
+        for behavior in ("pair", "decline"):
+            with self.subTest(behavior=behavior):
+                adapter = make_adapter(thread_sessions=True, unauthorized_dm_behavior=behavior)
+                key = self._mint_and_send(adapter)
+                index_before, file_before = dict(adapter._store._index), _store_path().read_text(encoding="utf-8")
+                with patch.dict(os.environ, {}):
+                    for name in ("EMAIL_ALLOW_ALL_USERS", "GATEWAY_ALLOW_ALL_USERS", "EMAIL_ALLOWED_USERS",
+                                 "GATEWAY_ALLOWED_USERS"):
+                        os.environ.pop(name, None)
+                    with patch.object(adapter, "_is_sender_authorized", return_value=False):
+                        new = self._dispatch(adapter, sender="Stranger <stranger@elsewhere.com>", subject="Hello",
+                                             message_id="<s1@elsewhere.com>")
+                        reply = self._dispatch(adapter, sender="Stranger <stranger@elsewhere.com>",
+                                               subject="Re: Report", in_reply_to=f"<{key}>", references=f"<{key}>",
+                                               message_id="<s2@elsewhere.com>")
+                    self.assertIsNotNone(new)
+                    self.assertIsNotNone(reply)
+                    self.assertIsNone(new.source.thread_id)
+                    self.assertIsNone(reply.source.thread_id)
+                    self.assertEqual(adapter._store._index, index_before)
+                    self.assertEqual(_store_path().read_text(encoding="utf-8"), file_before)
+                    self.assertEqual(adapter._root_context, {})
+                    with patch.object(adapter, "_is_sender_authorized", return_value=True):
+                        granted = self._dispatch(adapter, sender="Paired <paired@elsewhere.com>",
+                                                 subject="Re: Report", references=f"<{key}>",
+                                                 message_id="<p1@elsewhere.com>")
+                    self.assertEqual(granted.source.thread_id, key)
+
+    def test_inbound_message_id_never_repoints_an_indexed_id(self):
+        """An inbound mail whose Message-ID is already indexed (a root's own id, or an earlier mail's) leaves that
+        entry alone, so later replies keep reaching the original thread."""
+        adapter = make_adapter(thread_sessions=True)
+        key = self._mint_and_send(adapter)
+        other = self._dispatch(adapter, subject="Re: other", references="<other-root@test.com>",
+                               message_id=f"<{key}>")
+        self.assertEqual(other.source.thread_id, "other-root@test.com")
+        self.assertEqual(adapter._store.root_for([f"<{key}>"]), key)
+        self._dispatch(adapter, subject="Re: Report", references=f"<{key}>", message_id="<r1@test.com>")
+        self._dispatch(adapter, subject="Re: other", references="<other-root@test.com>", message_id="<r1@test.com>")
+        self._dispatch(adapter, subject="Fwd: Report", message_id="<r1@test.com>")  # a resent copy, no References
+        self.assertEqual(adapter._store.root_for(["<r1@test.com>"]), key)
+        reply = self._dispatch(adapter, subject="Re: Report", references=f"<{key}>", message_id="<r2@test.com>")
+        self.assertEqual(reply.source.thread_id, key)
+        self.assertEqual(make_adapter()._store.root_for([f"<{key}>", "<r1@test.com>"]), key)
 
 
 class TestColdStart(DispatchCase):
@@ -1136,7 +1226,9 @@ class TestDeliveredMessageIds(DispatchCase):
                               message_id="<f1@test.com>")
         fork_key = _root_key(answer_copy)
         self.assertEqual(fork.source.thread_id, fork_key)
-        self._poll(adapter, fake_folders({"INBOX": {}, "Sent": {"messages": sent}}))
+        with self.assertLogs("plugins.platforms.email.adapter", level="INFO") as logs:
+            self._poll(adapter, fake_folders({"INBOX": {}, "Sent": {"messages": sent}}))
+        self.assertTrue(any(fork_key in line and key in line for line in logs.output), logs.output)
         self.assertEqual(adapter._store.root_for([answer_copy]), key)
         later = self._dispatch(adapter, subject="Re: Report", in_reply_to=answer_copy, references=answer_copy,
                                message_id="<f2@test.com>")
@@ -1205,6 +1297,26 @@ class TestDeliveredMessageIds(DispatchCase):
                 else:
                     self.assertIn(expected, imap.selected)
                     self.assertEqual(adapter._store.root_for([answer_copy]), key)
+
+    def test_sent_folder_inbox_refused(self):
+        for setting in ("INBOX", " inbox "):
+            with self.subTest(setting=setting), self.assertLogs("plugins.platforms.email.adapter", "WARNING"):
+                adapter = make_adapter(sent_folder=setting)
+            self._thread(adapter)
+            imap = fake_folders({"INBOX": {}, "Sent": {"messages": {}}})
+            self._poll(adapter, imap)
+            self.assertEqual(imap.selected, ["INBOX"])
+            imap.list.assert_not_called()
+
+    def test_unselectable_sent_folder_warns_once(self):
+        adapter = make_adapter(sent_folder="Missing")
+        self._thread(adapter)
+        imap = fake_folders({"INBOX": {}})
+        with self.assertLogs("plugins.platforms.email.adapter", "WARNING") as logs:
+            self._poll(adapter, imap)
+            self._poll(adapter, imap)
+        self.assertEqual(sum("Missing" in line for line in logs.output), 1, logs.output)
+        self.assertEqual(imap.selected.count("Missing"), 2)
 
     def test_no_sent_folder_is_quiet_and_not_retried(self):
         adapter = make_adapter()

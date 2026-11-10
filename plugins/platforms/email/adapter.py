@@ -5,6 +5,7 @@ Cron deliveries can open mail threads (``create_handoff_thread``), and replies a
 import asyncio
 import email as email_lib
 from contextlib import contextmanager, suppress
+from functools import partial
 import hashlib
 import imaplib
 import json
@@ -148,6 +149,7 @@ def _attach_body(msg: MIMEMultipart, body: str, html: bool) -> None:
 
 _MSGID_RE = re.compile(r"<[^<>\s]+>")
 _ROOT_KEY_MAX = 120
+_TOPIC_ID_MAX = 200  # a thread's root Message-ID as shown in the session topic
 _THREAD_TTL_SECONDS = 90 * 86400  # thread roots (and the ids indexed to them) older than this are pruned on load
 _INDEX_MAX = 5000  # message-id -> root entries kept; the oldest go first
 _REFERENCES_MAX = 20  # ids in an outgoing References header: the root plus the newest 19
@@ -164,12 +166,22 @@ def _message_ids(header: Optional[str]) -> list[str]:
 
 
 def _root_key(raw: str) -> str:
-    """Session-key-safe thread root from a Message-ID: no ``<>``; anything with whitespace, ``..``, ``/``, ``\\``, a
-    drive-like ``X:`` start, or over 120 chars is replaced by ``h-`` + 24 hex of its SHA-256."""
+    """Session-key-safe thread root from a Message-ID: no ``<>``; anything with whitespace, ``..``, ``/``, ``\\``,
+    ``:`` (session keys are split on it), or over 120 chars is replaced by ``h-`` + 24 hex of its SHA-256."""
     key = (raw or "").strip().strip("<>").strip()
-    unsafe = (not key or len(key) > _ROOT_KEY_MAX or ".." in key or "/" in key or "\\" in key
-              or re.search(r"\s", key) or (len(key) >= 2 and key[0].isalpha() and key[1] == ":"))
+    unsafe = (not key or len(key) > _ROOT_KEY_MAX or ".." in key or "/" in key or "\\" in key or ":" in key
+              or re.search(r"\s", key))
     return "h-" + hashlib.sha256((raw or "").strip().encode("utf-8", "replace")).hexdigest()[:24] if unsafe else key
+
+
+def _shorten(text: str, limit: int = _TOPIC_ID_MAX) -> str:
+    """*text* cut to *limit* characters with a trailing ``…`` (a Message-ID shown in a prompt has no length limit)."""
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _thread_key(metadata: Optional[dict[str, Any]]) -> Optional[str]:
+    """The thread root a send's ``metadata["thread_id"]`` names, or ``None`` (a flat reply)."""
+    return str(metadata["thread_id"]) if metadata and metadata.get("thread_id") else None
 
 
 def _bare_id(message_id: Optional[str]) -> str:
@@ -332,6 +344,16 @@ class _EmailThreadStore:
             self._index[mid] = key
             self._cap_index()
 
+    def _index_new(self, message_id: Optional[str], key: str) -> bool:
+        """Index *message_id* to *key* unless it already maps to another live root: a mail id never moves to a
+        different thread once known (a resent copy, a client that reuses ids, a crafted id naming a root's own
+        header). Only the Sent-folder learner re-points ids. Caller holds the lock; True when indexed."""
+        current = self._index.get(_bare_id(message_id))
+        if current and current != key and current in self._roots:
+            return False
+        self._set_index(message_id, key)
+        return True
+
     def add_pending_root(self, key: str, header: str, name: str, chat_id: str) -> None:
         """Record a minted root that has not been sent yet (its first send goes out as a fresh mail)."""
         with self._lock:
@@ -367,16 +389,17 @@ class _EmailThreadStore:
                 return
             self._roots[key] = {"header": header or "", "name": "", "subject": subject or "", "job_id": "",
                                 "chat_id": "", "pending": False, "created": time.time()}
-            self._set_index(header, key)
+            self._index_new(header, key)
             self._save()
 
     def index_message(self, message_id: Optional[str], key: str) -> None:
-        """Map a message in the thread to its root (empty ids are ignored)."""
+        """Map a message in the thread to its root (empty ids, and ids already in another live thread, are
+        ignored)."""
         if not _bare_id(message_id):
             return
         with self._lock:
-            self._set_index(message_id, key)
-            self._save()
+            if self._index_new(message_id, key):
+                self._save()
 
     def has_roots(self) -> bool:
         with self._lock:
@@ -402,6 +425,8 @@ class _EmailThreadStore:
                     continue
                 if current in self._roots and current != _root_key(f"<{mid}>"):
                     continue
+                if current in self._roots:
+                    logger.info("[Email] Delivered id %s: replies move from thread %s to %s", mid, current, key)
                 self._set_index(mid, key)
                 learned += 1
             if learned:
@@ -836,6 +861,10 @@ class EmailAdapter(BasePlatformAdapter):
         sent = extra.get("sent_folder")
         off = sent is False or (isinstance(sent, str) and sent.strip().lower() in {"off", "false", "no", "none"})
         self._sent_folder: Optional[str] = None if off or not isinstance(sent, str) else sent.strip() or None
+        if self._sent_folder and self._sent_folder.upper() == "INBOX":  # inbound mail is not authenticated there
+            logger.warning("[Email] platforms.email.sent_folder may not be INBOX; not reading sent mail")
+            off, self._sent_folder = True, None
+        self._sent_select_failed = False  # warned once that the Sent folder cannot be selected
         self._sent_lookup = not off and self._sent_folder is None  # find the folder by LIST on first use
         self._sent_mark: Optional[tuple[Optional[str], int]] = None  # (UIDVALIDITY, highest UID read) this process
         # Require an authenticated From: domain (SPF/DKIM/DMARC) before trusting it for authorization
@@ -1136,6 +1165,10 @@ class EmailAdapter(BasePlatformAdapter):
             selected = True
             status, _ = imap.select(_quote_mailbox(self._sent_folder), readonly=True)
             if status != "OK":
+                if not self._sent_select_failed:
+                    self._sent_select_failed = True
+                    logger.warning("[Email] Could not select the Sent folder %s; replies naming only a "
+                                   "provider-assigned Message-ID are not matched to their thread", self._sent_folder)
                 return True
             validity = _uidvalidity(imap)
             mark = self._sent_mark[1] if self._sent_mark and self._sent_mark[0] == validity else None
@@ -1207,11 +1240,16 @@ class EmailAdapter(BasePlatformAdapter):
 
     def _sender_accepted(self, sender_addr: str, msg_data: dict[str, Any]) -> bool:
         """Pre-dispatch sender gate: self, automated, authorization, From: authentication."""
+        return self._sender_verdict(sender_addr, msg_data)[0]
+
+    def _sender_verdict(self, sender_addr: str, msg_data: dict[str, Any]) -> tuple[bool, bool]:
+        """``(accepted, granted)``: accepted mail is dispatched; a sender accepted but not granted access is
+        an unknown one the gateway only answers (``unauthorized_dm_behavior`` pair or decline)."""
         if sender_addr == self._address.lower():
-            return False
+            return False, False
         if _is_automated_sender(sender_addr, {}):
             logger.debug("[Email] Dropping automated sender at dispatch: %s", sender_addr)
-            return False
+            return False, False
         allowed_raw = _get_secret("EMAIL_ALLOWED_USERS", "").strip()
         # Parsed like the gateway's allowlists (JSON list literals included), or '["alice"]' would dodge the guard below.
         listed = set()
@@ -1226,7 +1264,7 @@ class EmailAdapter(BasePlatformAdapter):
             # The gateway's check also matches an address by its bare local part (#119446), so an entry like "alice"
             # would admit, or pair, alice@<any domain>; the domain is the sender's to choose.
             logger.debug("[Email] Dropping sender whose local part alone matches an allowlist entry: %s", sender_addr)
-            return False
+            return False, False
         else:
             # Approved pairings grant access too, and only the gateway's own check sees them. Its verdict also decides
             # open access: GATEWAY_ALLOW_ALL_USERS beside a GATEWAY_ALLOWED_USERS list grants a stranger nothing there.
@@ -1236,7 +1274,7 @@ class EmailAdapter(BasePlatformAdapter):
         # context) exists — otherwise a dispatch/authorization race can send a reply even though the handler returned None.
         if not granted and not self._answers_unknown_senders():
             logger.debug("[Email] Dropping unauthorized sender at dispatch (unknown senders are ignored): %s", sender_addr)
-            return False
+            return False, False
         # Reject spoofed senders (GHSA-rxqh-5572-8m77): every grant keys on the attacker-controlled From:, and a pairing
         # code or decline is mailed back to it; fail-closed. Open access is no exception: the session and every reply
         # key on From:, so a forged one lands in that address's conversation and makes the agent mail it.
@@ -1250,13 +1288,14 @@ class EmailAdapter(BasePlatformAdapter):
             else:
                 logger.debug("[Email] Dropping %s sender with unauthenticated From: %s (%s)",
                              "authorized" if granted else "unknown", sender_addr, auth_reason)
-            return False
-        return True
+            return False, False
+        return True, granted
 
     async def _dispatch_message(self, msg_data: dict[str, Any]) -> None:
         """Convert a fetched email into a MessageEvent and dispatch it."""
         sender_addr = msg_data["sender_addr"]
-        if not self._sender_accepted(sender_addr, msg_data):
+        accepted, granted = self._sender_verdict(sender_addr, msg_data)
+        if not accepted:
             return
         subject, body, attachments = msg_data["subject"], msg_data["body"].strip(), msg_data["attachments"]
         text = f"[Subject: {subject}]\n\n{body}" if subject and not subject.startswith("Re:") else body  # subject unless reply
@@ -1264,8 +1303,9 @@ class EmailAdapter(BasePlatformAdapter):
         # of message_type, but document-context injection gates strictly on MessageType.DOCUMENT — so DOCUMENT surfaces both.
         kinds = {att["type"] for att in attachments}
         self._thread_context[sender_addr] = {"subject": subject, "message_id": msg_data["message_id"]}
-        # Only after _sender_accepted: resolving may write the store, and strangers must not reach it.
-        key, header, topic = self._resolve_thread(msg_data)
+        # Only for a granted sender: resolving may write the store, and strangers must not reach it. An unknown
+        # sender the gateway answers (pair/decline) gets that answer flat.
+        key, header, topic = self._resolve_thread(msg_data) if granted else (None, "", "")
         if key:
             own = msg_data["message_id"]
             self._store.index_message(own, key)
@@ -1277,7 +1317,7 @@ class EmailAdapter(BasePlatformAdapter):
             message_type=MessageType.DOCUMENT if "document" in kinds else MessageType.PHOTO if "image" in kinds else MessageType.TEXT,
             source=self.build_source(chat_id=sender_addr, chat_name=name, chat_type="dm", user_id=sender_addr, user_name=name,
                                      message_id=msg_data["message_id"], thread_id=key,
-                                     chat_topic=f"{topic} (thread {header})" if key else None),
+                                     chat_topic=f"{topic} (thread {_shorten(header)})" if key else None),
             media_urls=[att["path"] for att in attachments], media_types=[att["media_type"] for att in attachments],
             reply_to_message_id=msg_data["in_reply_to"] or None)
         logger.info("[Email] New message from %s: %s", sender_addr, subject)
@@ -1317,9 +1357,8 @@ class EmailAdapter(BasePlatformAdapter):
         """Send an email to the given address. ``metadata["thread_id"]`` (a root from ``create_handoff_thread`` or an
         inbound thread) threads it under that root; ``metadata["job_id"]`` is recorded on a root's first mail."""
         meta = metadata or {}
-        thread_key = str(meta["thread_id"]) if meta.get("thread_id") else None
         job_id = str(meta.get("job_id") or "")
-        return await self._run_send(self._send_email, (chat_id, content, reply_to, thread_key, job_id),
+        return await self._run_send(self._send_email, (chat_id, content, reply_to, _thread_key(meta), job_id),
                                     "[Email] Send failed to %s: %s", chat_id)
 
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
@@ -1440,8 +1479,8 @@ class EmailAdapter(BasePlatformAdapter):
 
     async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
-        """Send an image URL as part of an email body (``metadata`` unused)."""
-        return await self.send(chat_id, f"{caption or ''}\n\nImage: {image_url}".strip(), reply_to)
+        """Send an image URL as part of an email body (in the thread ``metadata`` names, like ``send``)."""
+        return await self.send(chat_id, f"{caption or ''}\n\nImage: {image_url}".strip(), reply_to, metadata)
 
     async def send_multiple_images(self, chat_id: str, images: list[tuple[str, str]],
                                    metadata: Optional[dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
@@ -1462,29 +1501,34 @@ class EmailAdapter(BasePlatformAdapter):
         if not local_paths and not body_parts:
             return SendResult(success=False, error="no valid images in batch")
         try:
-            message_id = await asyncio.get_running_loop().run_in_executor(None, self._send_email_with_attachments, chat_id, "\n\n".join(body_parts), local_paths)
+            send = partial(self._send_email_with_attachments, thread_key=_thread_key(metadata))
+            message_id = await asyncio.get_running_loop().run_in_executor(None, send, chat_id, "\n\n".join(body_parts), local_paths)
         except Exception as e:
             logger.error("[Email] Multi-image send failed, falling back: %s", e, exc_info=True)
             return await super().send_multiple_images(chat_id, images, metadata, human_delay)
         return SendResult(success=True, message_id=message_id)
 
-    def _send_email_with_attachments(self, to_addr: str, body: str, file_paths: list[str]) -> str:
+    def _send_email_with_attachments(self, to_addr: str, body: str, file_paths: list[str],
+                                     thread_key: Optional[str] = None) -> str:
         """Send an email with multiple file attachments via SMTP (unattachable files are skipped)."""
-        msg_id = self._send_with_files(to_addr, body, [(Path(f), Path(f).name) for f in file_paths], lenient=True)
+        msg_id = self._send_with_files(to_addr, body, [(Path(f), Path(f).name) for f in file_paths], lenient=True,
+                                       thread_key=thread_key)
         logger.info("[Email] Sent multi-attachment email to %s (%d files)", to_addr, len(file_paths))
         return msg_id
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
-                            file_name: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
-        """Send a file as an email attachment."""
-        return await self._run_send(self._send_email_with_attachment, (chat_id, caption or "", file_path, file_name, reply_to),
+                            file_name: Optional[str] = None, reply_to: Optional[str] = None,
+                            metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
+        """Send a file as an email attachment (in the thread ``metadata`` names, like ``send``)."""
+        return await self._run_send(self._send_email_with_attachment,
+                                    (chat_id, caption or "", file_path, file_name, reply_to, _thread_key(metadata)),
                                     "[Email] Send document failed: %s")
 
     def _send_email_with_attachment(self, to_addr: str, body: str, file_path: str, file_name: Optional[str] = None,
-                                    reply_to_msg_id: Optional[str] = None) -> str:
+                                    reply_to_msg_id: Optional[str] = None, thread_key: Optional[str] = None) -> str:
         """Send an email with a single file attachment via SMTP (raises if unattachable)."""
         return self._send_with_files(to_addr, body, [(Path(file_path), file_name or Path(file_path).name)], lenient=False,
-                                     reply_to_msg_id=reply_to_msg_id)
+                                     reply_to_msg_id=reply_to_msg_id, thread_key=thread_key)
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         """Return basic info about the email chat."""

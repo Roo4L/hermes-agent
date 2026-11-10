@@ -48,3 +48,31 @@ def test_thread_reply_chat_type_table_has_email_dm():
     assert _THREAD_REPLY_CHAT_TYPE["slack"] == "group"
     assert _THREAD_REPLY_CHAT_TYPE["matrix"] == "group"
     assert _THREAD_REPLY_CHAT_TYPE["telegram"] == "group"
+
+
+def test_email_target_with_capitals_keys_like_the_reply():
+    """A deliver target written with capitals resolves lowercase, as the adapter lowercases every inbound
+    sender, so the thread seeded for the report and the reply share one session key."""
+    from cron.scheduler_delivery import _resolve_delivery_targets
+    from plugins.platforms.email.adapter import _extract_email_address
+
+    targets = _resolve_delivery_targets({"id": "j1", "deliver": "email:User@Example.COM"})
+    assert [t["chat_id"] for t in targets] == ["user@example.com"]
+    with patch("cron.scheduler_delivery._get_home_target_chat_id", return_value="User@Example.COM"):
+        home = _resolve_delivery_targets({"id": "j2", "deliver": "email"})
+    assert [t["chat_id"] for t in home] == ["user@example.com"]
+
+    store = MagicMock()
+    adapter = MagicMock()
+    adapter._session_store = store
+    with patch("gateway.mirror.mirror_to_session", return_value=True):
+        _seed_cron_thread_session(
+            {"id": "j1", "name": "Report"}, adapter, "email",
+            targets[0]["chat_id"], "hermes-abc123@example.com", "report body",
+        )
+    sender = _extract_email_address("User <User@Example.COM>")
+    inbound = SessionSource(
+        platform=Platform.EMAIL, chat_id=sender, chat_type="dm",
+        user_id=sender, thread_id="hermes-abc123@example.com",
+    )
+    assert build_session_key(store.get_or_create_session.call_args[0][0]) == build_session_key(inbound)
